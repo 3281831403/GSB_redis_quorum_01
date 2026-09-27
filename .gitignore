@@ -1,0 +1,6 @@
+/bin
+.bash_history
+.vscode
+.idea/
+/tmp
+vendor

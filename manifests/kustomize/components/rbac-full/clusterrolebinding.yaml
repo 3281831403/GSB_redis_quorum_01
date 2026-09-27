@@ -1,0 +1,15 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: redis-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: redis-operator
+subjects:
+  - kind: ServiceAccount
+    name: redis-operator
+    # A ClusterRoleBinding subject carries no namespace of its own, so one
+    # has to be named here. Setting `namespace:` in a kustomization rewrites
+    # it, so an install into another namespace binds to its own account.
+    namespace: default

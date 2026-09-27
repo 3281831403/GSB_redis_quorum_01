@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+labels:
+  - pairs:
+      app.kubernetes.io/version: 4.7.1
+
+images:
+  - name: ghcr.io/powerhome/redis-operator
+    newTag: v4.7.1

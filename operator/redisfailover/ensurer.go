@@ -1,0 +1,104 @@
+package redisfailover
+
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	redisfailoverv1 "github.com/spotahome/redis-operator/api/redisfailover/v1"
+	"github.com/spotahome/redis-operator/metrics"
+)
+
+// Ensure is called to ensure all of the resources associated with a RedisFailover are created
+func (w *RedisFailoverHandler) Ensure(rf *redisfailoverv1.RedisFailover, labels map[string]string, or []metav1.OwnerReference, metricsClient metrics.Recorder) error {
+	if rf.Spec.Redis.Exporter.Enabled {
+		if err := w.rfService.EnsureRedisService(rf, labels, or); err != nil {
+			return err
+		}
+	} else {
+		if err := w.rfService.EnsureNotPresentRedisService(rf); err != nil {
+			return err
+		}
+	}
+
+	if !(len(rf.Spec.NetworkPolicyNsList) == 0) {
+		if err := w.rfService.EnsureSentinelNetworkPolicy(rf, labels, or); err != nil {
+			return err
+		}
+	}
+
+	if err := w.rfService.DestroydOrphanedRedisNetworkPolicy(rf); err != nil {
+		return err
+	}
+
+	// Whenever HAProxy should not be running, its resources are removed. That
+	// covers the failover being bootstrapped, and it covers the haproxy block
+	// being taken out of the spec: previously the outer condition let the second
+	// case reach neither branch, so a proxy kept serving traffic from a
+	// configuration nothing would update again.
+	if rf.Spec.Haproxy != nil && rf.HaproxyAllowed() {
+		if err := w.rfService.EnsureHAProxyRedisMasterService(rf, labels, or); err != nil {
+			return err
+		}
+
+		if err := w.rfService.EnsureRedisHeadlessService(rf, labels, or); err != nil {
+			return err
+		}
+
+		if err := w.rfService.EnsureHAProxyRedisMasterConfigmap(rf, labels, or); err != nil {
+			return err
+		}
+
+		if err := w.rfService.EnsureHAProxyRedisMasterDeployment(rf, labels, or); err != nil {
+			return err
+		}
+
+		if err := w.rfService.DestroyOrphanedRedisSlaveHaProxy(rf); err != nil {
+			return err
+		}
+	} else {
+		if err := w.rfService.DestroyHaproxyMasterResources(rf); err != nil {
+			return err
+		}
+	}
+
+	if err := w.rfService.EnsureRedisMasterService(rf, labels, or); err != nil {
+		return err
+	}
+
+	if err := w.rfService.EnsureRedisSlaveService(rf, labels, or); err != nil {
+		return err
+	}
+
+	if err := w.rfService.EnsureRedisShutdownConfigMap(rf, labels, or); err != nil {
+		return err
+	}
+	if err := w.rfService.EnsureRedisReadinessConfigMap(rf, labels, or); err != nil {
+		return err
+	}
+	if err := w.rfService.EnsureRedisConfigMap(rf, labels, or); err != nil {
+		return err
+	}
+	if err := w.rfService.EnsureRedisStatefulset(rf, labels, or); err != nil {
+		return err
+	}
+
+	sentinelsAllowed := rf.SentinelsAllowed()
+	if sentinelsAllowed {
+
+		if err := w.rfService.EnsureSentinelService(rf, labels, or); err != nil {
+			return err
+		}
+		if err := w.rfService.EnsureSentinelConfigMap(rf, labels, or); err != nil {
+			return err
+		}
+
+		if err := w.rfService.EnsureSentinelDeployment(rf, labels, or); err != nil {
+			return err
+		}
+	} else {
+		if err := w.rfService.DestroySentinelResources(rf); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}

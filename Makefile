@@ -1,0 +1,218 @@
+VERSION := v4.7.1
+
+# Name of this service/application
+SERVICE_NAME := redis-operator
+
+# Docker image name for this project
+IMAGE_NAME := powerhome/$(SERVICE_NAME)
+
+# Repository url for this project
+REPOSITORY := $(IMAGE_NAME)
+
+# Get docker path or an empty string
+DOCKER := $(shell command -v docker)
+
+# Get the unix user id for the user running make (to be used by docker bake)
+UID := $(shell id -u)
+
+GIT_COMMIT=$(shell git rev-parse HEAD)
+IMAGE_TAG := $(GIT_COMMIT)
+ifneq ($(shell git status --porcelain),)
+	IMAGE_TAG := $(IMAGE_TAG)-dirty
+endif
+
+PROJECT_PACKAGE := github.com/spotahome/redis-operator
+# Two things this image needs told to it.
+#
+# It is published for linux/amd64 only, so the platform is named rather than
+# left to Docker, which has no arm64 entry to fall back from and refuses to
+# start. Naming it costs nothing where the host is already amd64.
+#
+# It also carries a Go older than the one go.mod asks for, and pins
+# GOTOOLCHAIN to local so it will not fetch one. No published tag of it ships a
+# Go new enough. Letting it fetch the toolchain go.mod names is what makes the
+# generators run at all.
+CODEGEN_IMAGE := ghcr.io/slok/kube-code-generator:v0.6.0
+CODEGEN_PLATFORM := linux/amd64
+PORT := 9710
+
+GOLANGCI_LINT_VERSION := v2.13.2
+GOLANGCI_LINT_IMAGE := golangci/golangci-lint:$(GOLANGCI_LINT_VERSION)
+
+ACTIONLINT_VERSION := 1.7.12
+ACTIONLINT_IMAGE := rhysd/actionlint:$(ACTIONLINT_VERSION)
+
+# workdir
+WORKDIR := /go/src/github.com/spotahome/redis-operator
+
+# CMDs
+UNIT_TEST_CMD := go test `go list ./... | grep -v /vendor/` -v
+HELM_TEST_CMD := ./scripts/helm-tests.sh
+GO_GENERATE_CMD := go generate `go list ./... | grep -v /vendor/`
+GO_INTEGRATION_TEST_CMD := go test `go list ./... | grep test/integration` -v -tags='integration'
+MOCKS_CMD := go generate ./mocks
+DOCKER_RUN_CMD :=	$(DOCKER) run -ti --rm \
+	  -v $(PWD):$(WORKDIR) \
+	  -u $(UID):$(UID) \
+	  --name $(SERVICE_NAME) \
+	  -p $(PORT):$(PORT) \
+	  $(REPOSITORY)-dev
+
+# The default action of this Makefile is to build the development docker image
+.PHONY: default
+default: test
+
+.PHONY: ensure-docker
+# Test if the dependencies we need to run this Makefile are installed
+ensure-docker:
+ifndef DOCKER
+	@echo "Docker is not available. Please install docker"
+	@exit 1
+endif
+
+# Build the operator image for local, end-to-end testing purposes
+.PHONY: image-local
+image-local: ensure-docker
+	docker buildx bake \
+	  --set build-local.tags="$(IMAGE_NAME):latest" \
+	  --set build-local.tags="$(IMAGE_NAME):$(IMAGE_TAG)" \
+	  build-local
+
+# Build the development environment docker image
+.PHONY: image-dev-tools
+image-dev-tools: ensure-docker
+	docker buildx bake \
+	  --set dev.args.uid=$(UID) \
+	  --set dev.tags="$(IMAGE_NAME)-dev:latest" \
+	  dev
+
+# Connect to a BASH shell the development docker image
+.PHONY: shell
+shell: image-dev-tools
+	$(DOCKER_RUN_CMD) /bin/bash
+
+# Tag an operator release. The tag name comes from VERSION above. See the
+# script for what it refuses.
+.PHONY: tag-operator
+tag-operator:
+	@./scripts/tag-operator.sh
+
+# Tag a chart-only release. The tag name comes from Chart.yaml, where the
+# chart's version lives because it moves without the operator. See the script
+# for what it refuses.
+.PHONY: tag-chart
+tag-chart:
+	@./scripts/tag-chart.sh
+
+# Tag a release: both the operator and the chart it publishes alongside it.
+.PHONY: tag
+tag: tag-operator tag-chart
+
+# Run unit tests in the development docker container (DEV)
+.PHONY: test-unit
+test-unit: image-dev-tools
+	$(DOCKER_RUN_CMD) /bin/sh -c '$(UNIT_TEST_CMD)'
+
+# Run helm tests in the development docker container (DEV)
+.PHONY: test-helm
+test-helm:
+	$(DOCKER_RUN_CMD) $(HELM_TEST_CMD)
+
+# Run all (DEV) tests
+.PHONY: test
+test: test-unit test-helm
+
+# Run unit tests on the host (CI)
+.PHONY: test-unit-ci
+test-unit-ci:
+	$(UNIT_TEST_CMD)
+
+# Run integration tests on the host (CI)
+.PHONY: test-integration-ci
+test-integration-ci:
+	$(GO_INTEGRATION_TEST_CMD)
+
+# Run helm tests on the host (CI)
+.PHONY: test-helm-ci
+test-helm-ci:
+	$(HELM_TEST_CMD)
+
+# Generate kubernetes client
+.PHONY: generate-client
+generate-client:
+	@echo ">> Generating code for Kubernetes CRD types..."
+	docker run --rm $(DOCKER_INTERACTIVE) \
+		--platform $(CODEGEN_PLATFORM) \
+		-e GOTOOLCHAIN=auto \
+		-v $(PWD):$(WORKDIR) \
+		-w $(WORKDIR) \
+		$(CODEGEN_IMAGE) \
+		--apis-in ./api \
+		--go-gen-out ./client/k8s
+
+# Allocate a TTY for interactive local runs, but let CI override it with
+# `DOCKER_INTERACTIVE=` so `make generate-crd` works on a runner with no TTY.
+DOCKER_INTERACTIVE ?= -it
+
+# Make every version marker agree with VERSION above, after editing it.
+#
+# The chart's own version is not one of those markers. It is set by hand in
+# Chart.yaml, because it moves without the operator. Neither changelog is
+# written here either: both want prose. The script lists what it leaves for a
+# person when it finishes.
+.PHONY: prepare-release
+prepare-release:
+	@./scripts/prepare-release.sh "$(VERSION)"
+
+# Generate kubernetes Custom Resource Definitions
+.PHONY: generate-crd
+generate-crd:
+	docker run --rm $(DOCKER_INTERACTIVE) \
+		--platform $(CODEGEN_PLATFORM) \
+		-e GOTOOLCHAIN=auto \
+		-v $(PWD):$(WORKDIR) \
+		-w $(WORKDIR) \
+		$(CODEGEN_IMAGE) \
+		--apis-in ./api \
+		--crd-gen-out ./manifests
+	cp -f manifests/databases.spotahome.com_redisfailovers.yaml manifests/kustomize/base
+	cp -f manifests/databases.spotahome.com_redisfailovers.yaml charts/redisoperator/crds/databases.spotahome.com_redisfailovers.yaml
+
+.PHONY: generate-go
+generate-go: image-dev-tools
+	docker run --rm $(DOCKER_INTERACTIVE) \
+	  -v $(PWD):$(WORKDIR) \
+	  -u $(UID):$(UID) \
+	  --name $(SERVICE_NAME) $(REPOSITORY)-dev \
+	  /bin/sh -c '$(GO_GENERATE_CMD)'
+
+# Generate testing mocks
+.PHONY: generate-mocks
+generate-mocks: image-dev-tools
+	docker run --rm $(DOCKER_INTERACTIVE) \
+	  -v $(PWD):$(WORKDIR) \
+	  -u $(UID):$(UID) \
+	  --name $(SERVICE_NAME) \
+	  $(REPOSITORY)-dev /bin/sh -c '$(MOCKS_CMD)'
+
+# Run lint
+.PHONY: lint
+lint:
+	docker run --rm $(DOCKER_INTERACTIVE) \
+	  -v $(PWD):$(WORKDIR) \
+	  -w $(WORKDIR) \
+	  $(GOLANGCI_LINT_IMAGE) \
+	  golangci-lint run --fix --timeout=15m
+
+# Lint the GitHub Actions workflow files
+.PHONY: lint-workflows
+lint-workflows:
+	docker run --rm \
+	  -v $(PWD):$(WORKDIR) \
+	  -w $(WORKDIR) \
+	  $(ACTIONLINT_IMAGE) \
+	  -color
+
+# Run all code generators
+.PHONY: generate
+generate: generate-go generate-mocks generate-client generate-crd

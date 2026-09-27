@@ -1,0 +1,4134 @@
+package service_test
+
+import (
+	"errors"
+	"fmt"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/intstr"
+
+	redisfailoverv1 "github.com/spotahome/redis-operator/api/redisfailover/v1"
+	"github.com/spotahome/redis-operator/log"
+	"github.com/spotahome/redis-operator/metrics"
+	mK8SService "github.com/spotahome/redis-operator/mocks/service/k8s"
+	rfservice "github.com/spotahome/redis-operator/operator/redisfailover/service"
+)
+
+// notFound builds the error the Kubernetes API returns for an object that does
+// not exist.
+//
+// A test standing in for "nothing deployed yet" needs this rather than an error
+// that merely reads like it. The operator tells an absent object apart from one
+// it could not read, and acts differently on each, so a plain error saying "not
+// found" stands for the wrong one of the two.
+func notFound(resource, name string) error {
+	return apierrors.NewNotFound(appsv1.Resource(resource), name)
+}
+
+func TestRedisStatefulSetStorageGeneration(t *testing.T) {
+	configMapName := rfservice.GetRedisName(generateRF())
+	shutdownConfigMapName := rfservice.GetRedisShutdownConfigMapName(generateRF())
+	readinesConfigMapName := rfservice.GetRedisReadinessName(generateRF())
+	executeMode := int32(0744)
+	tests := []struct {
+		name           string
+		ownerRefs      []metav1.OwnerReference
+		expectedSS     appsv1.StatefulSet
+		rfRedisStorage redisfailoverv1.RedisStorage
+	}{
+		{
+			name: "Default values",
+			expectedSS: appsv1.StatefulSet{
+				Spec: appsv1.StatefulSetSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									VolumeMounts: []corev1.VolumeMount{
+										{
+											Name:      "redis-config",
+											MountPath: "/redis",
+										},
+										{
+											Name:      "redis-shutdown-config",
+											MountPath: "/redis-shutdown",
+										},
+										{
+											Name:      "redis-readiness-config",
+											MountPath: "/redis-readiness",
+										},
+										{
+											Name:      "redis-data",
+											MountPath: "/data",
+										},
+									},
+								},
+							},
+							Volumes: []corev1.Volume{
+								{
+									Name: "redis-config",
+									VolumeSource: corev1.VolumeSource{
+										ConfigMap: &corev1.ConfigMapVolumeSource{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: configMapName,
+											},
+										},
+									},
+								},
+								{
+									Name: "redis-shutdown-config",
+									VolumeSource: corev1.VolumeSource{
+										ConfigMap: &corev1.ConfigMapVolumeSource{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: shutdownConfigMapName,
+											},
+											DefaultMode: &executeMode,
+										},
+									},
+								},
+								{
+									Name: "redis-readiness-config",
+									VolumeSource: corev1.VolumeSource{
+										ConfigMap: &corev1.ConfigMapVolumeSource{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: readinesConfigMapName,
+											},
+											DefaultMode: &executeMode,
+										},
+									},
+								},
+								{
+									Name: "redis-data",
+									VolumeSource: corev1.VolumeSource{
+										EmptyDir: &corev1.EmptyDirVolumeSource{},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			rfRedisStorage: redisfailoverv1.RedisStorage{},
+		},
+		{
+			name: "Defined an emptydir with storage on memory",
+			expectedSS: appsv1.StatefulSet{
+				Spec: appsv1.StatefulSetSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									VolumeMounts: []corev1.VolumeMount{
+										{
+											Name:      "redis-config",
+											MountPath: "/redis",
+										},
+										{
+											Name:      "redis-shutdown-config",
+											MountPath: "/redis-shutdown",
+										},
+										{
+											Name:      "redis-readiness-config",
+											MountPath: "/redis-readiness",
+										},
+										{
+											Name:      "redis-data",
+											MountPath: "/data",
+										},
+									},
+								},
+							},
+							Volumes: []corev1.Volume{
+								{
+									Name: "redis-config",
+									VolumeSource: corev1.VolumeSource{
+										ConfigMap: &corev1.ConfigMapVolumeSource{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: configMapName,
+											},
+										},
+									},
+								},
+								{
+									Name: "redis-shutdown-config",
+									VolumeSource: corev1.VolumeSource{
+										ConfigMap: &corev1.ConfigMapVolumeSource{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: shutdownConfigMapName,
+											},
+											DefaultMode: &executeMode,
+										},
+									},
+								},
+								{
+									Name: "redis-readiness-config",
+									VolumeSource: corev1.VolumeSource{
+										ConfigMap: &corev1.ConfigMapVolumeSource{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: readinesConfigMapName,
+											},
+											DefaultMode: &executeMode,
+										},
+									},
+								},
+								{
+									Name: "redis-data",
+									VolumeSource: corev1.VolumeSource{
+										EmptyDir: &corev1.EmptyDirVolumeSource{
+											Medium: corev1.StorageMediumMemory,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			rfRedisStorage: redisfailoverv1.RedisStorage{
+				EmptyDir: &corev1.EmptyDirVolumeSource{
+					Medium: corev1.StorageMediumMemory,
+				},
+			},
+		},
+		{
+			name: "Defined an persistentvolumeclaim",
+			expectedSS: appsv1.StatefulSet{
+				Spec: appsv1.StatefulSetSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									VolumeMounts: []corev1.VolumeMount{
+										{
+											Name:      "redis-config",
+											MountPath: "/redis",
+										},
+										{
+											Name:      "redis-shutdown-config",
+											MountPath: "/redis-shutdown",
+										},
+										{
+											Name:      "redis-readiness-config",
+											MountPath: "/redis-readiness",
+										},
+										{
+											Name:      "pvc-data",
+											MountPath: "/data",
+										},
+									},
+								},
+							},
+							Volumes: []corev1.Volume{
+								{
+									Name: "redis-config",
+									VolumeSource: corev1.VolumeSource{
+										ConfigMap: &corev1.ConfigMapVolumeSource{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: configMapName,
+											},
+										},
+									},
+								},
+								{
+									Name: "redis-shutdown-config",
+									VolumeSource: corev1.VolumeSource{
+										ConfigMap: &corev1.ConfigMapVolumeSource{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: shutdownConfigMapName,
+											},
+											DefaultMode: &executeMode,
+										},
+									},
+								},
+								{
+									Name: "redis-readiness-config",
+									VolumeSource: corev1.VolumeSource{
+										ConfigMap: &corev1.ConfigMapVolumeSource{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: readinesConfigMapName,
+											},
+											DefaultMode: &executeMode,
+										},
+									},
+								},
+							},
+						},
+					},
+					VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+						{
+							TypeMeta: metav1.TypeMeta{
+								Kind:       "PersistentVolumeClaim",
+								APIVersion: "v1",
+							},
+							ObjectMeta: metav1.ObjectMeta{
+								Name: "pvc-data",
+							},
+							Spec: corev1.PersistentVolumeClaimSpec{
+								AccessModes: []corev1.PersistentVolumeAccessMode{
+									"ReadWriteOnce",
+								},
+								Resources: corev1.VolumeResourceRequirements{
+									Requests: corev1.ResourceList{
+										corev1.ResourceStorage: resource.MustParse("1Gi"),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			rfRedisStorage: redisfailoverv1.RedisStorage{
+				PersistentVolumeClaim: &redisfailoverv1.EmbeddedPersistentVolumeClaim{
+					EmbeddedObjectMetadata: redisfailoverv1.EmbeddedObjectMetadata{
+						Name: "pvc-data",
+					},
+					Spec: corev1.PersistentVolumeClaimSpec{
+						AccessModes: []corev1.PersistentVolumeAccessMode{
+							"ReadWriteOnce",
+						},
+						Resources: corev1.VolumeResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceStorage: resource.MustParse("1Gi"),
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Defined an persistentvolumeclaim with ownerRefs",
+			ownerRefs: []metav1.OwnerReference{
+				{
+					Name: "testing",
+				},
+			},
+			expectedSS: appsv1.StatefulSet{
+				Spec: appsv1.StatefulSetSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									VolumeMounts: []corev1.VolumeMount{
+										{
+											Name:      "redis-config",
+											MountPath: "/redis",
+										},
+										{
+											Name:      "redis-shutdown-config",
+											MountPath: "/redis-shutdown",
+										},
+										{
+											Name:      "redis-readiness-config",
+											MountPath: "/redis-readiness",
+										},
+										{
+											Name:      "pvc-data",
+											MountPath: "/data",
+										},
+									},
+								},
+							},
+							Volumes: []corev1.Volume{
+								{
+									Name: "redis-config",
+									VolumeSource: corev1.VolumeSource{
+										ConfigMap: &corev1.ConfigMapVolumeSource{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: configMapName,
+											},
+										},
+									},
+								},
+								{
+									Name: "redis-shutdown-config",
+									VolumeSource: corev1.VolumeSource{
+										ConfigMap: &corev1.ConfigMapVolumeSource{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: shutdownConfigMapName,
+											},
+											DefaultMode: &executeMode,
+										},
+									},
+								},
+								{
+									Name: "redis-readiness-config",
+									VolumeSource: corev1.VolumeSource{
+										ConfigMap: &corev1.ConfigMapVolumeSource{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: readinesConfigMapName,
+											},
+											DefaultMode: &executeMode,
+										},
+									},
+								},
+							},
+						},
+					},
+					VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+						{
+							TypeMeta: metav1.TypeMeta{
+								Kind:       "PersistentVolumeClaim",
+								APIVersion: "v1",
+							},
+							ObjectMeta: metav1.ObjectMeta{
+								Name: "pvc-data",
+								OwnerReferences: []metav1.OwnerReference{
+									{
+										Name: "testing",
+									},
+								},
+							},
+							Spec: corev1.PersistentVolumeClaimSpec{
+								AccessModes: []corev1.PersistentVolumeAccessMode{
+									"ReadWriteOnce",
+								},
+								Resources: corev1.VolumeResourceRequirements{
+									Requests: corev1.ResourceList{
+										corev1.ResourceStorage: resource.MustParse("1Gi"),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			rfRedisStorage: redisfailoverv1.RedisStorage{
+				PersistentVolumeClaim: &redisfailoverv1.EmbeddedPersistentVolumeClaim{
+					EmbeddedObjectMetadata: redisfailoverv1.EmbeddedObjectMetadata{
+						Name: "pvc-data",
+					},
+					Spec: corev1.PersistentVolumeClaimSpec{
+						AccessModes: []corev1.PersistentVolumeAccessMode{
+							"ReadWriteOnce",
+						},
+						Resources: corev1.VolumeResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceStorage: resource.MustParse("1Gi"),
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Defined an persistentvolumeclaim with ownerRefs keeping the pvc",
+			ownerRefs: []metav1.OwnerReference{
+				{
+					Name: "testing",
+				},
+			},
+			expectedSS: appsv1.StatefulSet{
+				Spec: appsv1.StatefulSetSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									VolumeMounts: []corev1.VolumeMount{
+										{
+											Name:      "redis-config",
+											MountPath: "/redis",
+										},
+										{
+											Name:      "redis-shutdown-config",
+											MountPath: "/redis-shutdown",
+										},
+										{
+											Name:      "redis-readiness-config",
+											MountPath: "/redis-readiness",
+										},
+										{
+											Name:      "pvc-data",
+											MountPath: "/data",
+										},
+									},
+								},
+							},
+							Volumes: []corev1.Volume{
+								{
+									Name: "redis-config",
+									VolumeSource: corev1.VolumeSource{
+										ConfigMap: &corev1.ConfigMapVolumeSource{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: configMapName,
+											},
+										},
+									},
+								},
+								{
+									Name: "redis-shutdown-config",
+									VolumeSource: corev1.VolumeSource{
+										ConfigMap: &corev1.ConfigMapVolumeSource{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: shutdownConfigMapName,
+											},
+											DefaultMode: &executeMode,
+										},
+									},
+								},
+								{
+									Name: "redis-readiness-config",
+									VolumeSource: corev1.VolumeSource{
+										ConfigMap: &corev1.ConfigMapVolumeSource{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: readinesConfigMapName,
+											},
+											DefaultMode: &executeMode,
+										},
+									},
+								},
+							},
+						},
+					},
+					VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+						{
+							TypeMeta: metav1.TypeMeta{
+								Kind:       "PersistentVolumeClaim",
+								APIVersion: "v1",
+							},
+							ObjectMeta: metav1.ObjectMeta{
+								Name: "pvc-data",
+							},
+							Spec: corev1.PersistentVolumeClaimSpec{
+								AccessModes: []corev1.PersistentVolumeAccessMode{
+									"ReadWriteOnce",
+								},
+								Resources: corev1.VolumeResourceRequirements{
+									Requests: corev1.ResourceList{
+										corev1.ResourceStorage: resource.MustParse("1Gi"),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			rfRedisStorage: redisfailoverv1.RedisStorage{
+				KeepAfterDeletion: true,
+				PersistentVolumeClaim: &redisfailoverv1.EmbeddedPersistentVolumeClaim{
+					EmbeddedObjectMetadata: redisfailoverv1.EmbeddedObjectMetadata{
+						Name: "pvc-data",
+					},
+					Spec: corev1.PersistentVolumeClaimSpec{
+						AccessModes: []corev1.PersistentVolumeAccessMode{
+							"ReadWriteOnce",
+						},
+						Resources: corev1.VolumeResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceStorage: resource.MustParse("1Gi"),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		// Generate a default RedisFailover and attaching the required storage
+		rf := generateRF()
+		rf.Spec.Redis.Storage = test.rfRedisStorage
+
+		generatedStatefulSet := appsv1.StatefulSet{}
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetStatefulSet", namespace, mock.Anything).Once().Return(nil, notFound("statefulsets", name))
+		ms.On("CreateOrUpdateStatefulSet", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			ss := args.Get(1).(*appsv1.StatefulSet)
+			generatedStatefulSet = *ss
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureRedisStatefulset(rf, nil, test.ownerRefs)
+
+		// Check that the storage-related fields are as expected
+		assert.Equal(test.expectedSS.Spec.Template.Spec.Volumes, generatedStatefulSet.Spec.Template.Spec.Volumes)
+		assert.Equal(test.expectedSS.Spec.Template.Spec.Containers[0].VolumeMounts, generatedStatefulSet.Spec.Template.Spec.Containers[0].VolumeMounts)
+		assert.Equal(test.expectedSS.Spec.VolumeClaimTemplates, generatedStatefulSet.Spec.VolumeClaimTemplates)
+		assert.NoError(err)
+	}
+}
+
+func TestRedisStatefulSetCommands(t *testing.T) {
+	tests := []struct {
+		name             string
+		givenCommands    []string
+		expectedCommands []string
+	}{
+		{
+			name:          "Default values",
+			givenCommands: []string{},
+			expectedCommands: []string{
+				"redis-server",
+				"/redis/redis.conf",
+			},
+		},
+		{
+			name: "Given commands should be used in redis container",
+			givenCommands: []string{
+				"test",
+				"command",
+			},
+			expectedCommands: []string{
+				"test",
+				"command",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		// Generate a default RedisFailover and attaching the required storage
+		rf := generateRF()
+		rf.Spec.Redis.Command = test.givenCommands
+
+		gotCommands := []string{}
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetStatefulSet", namespace, mock.Anything).Once().Return(nil, notFound("statefulsets", name))
+		ms.On("CreateOrUpdateStatefulSet", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			ss := args.Get(1).(*appsv1.StatefulSet)
+			gotCommands = ss.Spec.Template.Spec.Containers[0].Command
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
+
+		assert.Equal(test.expectedCommands, gotCommands)
+		assert.NoError(err)
+	}
+}
+
+func TestSentinelDeploymentCommands(t *testing.T) {
+	tests := []struct {
+		name             string
+		givenCommands    []string
+		expectedCommands []string
+	}{
+		{
+			name:          "Default values",
+			givenCommands: []string{},
+			expectedCommands: []string{
+				"redis-server",
+				"/redis/sentinel.conf",
+				"--sentinel",
+			},
+		},
+		{
+			name: "Given commands should be used in sentinel container",
+			givenCommands: []string{
+				"test",
+				"command",
+			},
+			expectedCommands: []string{
+				"test",
+				"command",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		// Generate a default RedisFailover and attaching the required storage
+		rf := generateRF()
+		rf.Spec.Sentinel.Command = test.givenCommands
+
+		gotCommands := []string{}
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetDeployment", namespace, mock.Anything).Once().Return(nil, notFound("deployments", name))
+		ms.On("CreateOrUpdateDeployment", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			d := args.Get(1).(*appsv1.Deployment)
+			gotCommands = d.Spec.Template.Spec.Containers[0].Command
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureSentinelDeployment(rf, nil, []metav1.OwnerReference{})
+
+		assert.Equal(test.expectedCommands, gotCommands)
+		assert.NoError(err)
+	}
+}
+
+func TestRedisStatefulSetPodAnnotations(t *testing.T) {
+	tests := []struct {
+		name                   string
+		givenPodAnnotations    map[string]string
+		expectedPodAnnotations map[string]string
+	}{
+		{
+			name:                   "PodAnnotations was not defined",
+			givenPodAnnotations:    nil,
+			expectedPodAnnotations: nil,
+		},
+		{
+			name: "PodAnnotations is defined",
+			givenPodAnnotations: map[string]string{
+				"some":               "annotation",
+				"path/to/annotation": "here",
+			},
+			expectedPodAnnotations: map[string]string{
+				"some":               "annotation",
+				"path/to/annotation": "here",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		// Generate a default RedisFailover and attaching the required annotations
+		rf := generateRF()
+		rf.Spec.Redis.PodAnnotations = test.givenPodAnnotations
+
+		gotPodAnnotations := map[string]string{}
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetStatefulSet", namespace, mock.Anything).Once().Return(nil, notFound("statefulsets", name))
+		ms.On("CreateOrUpdateStatefulSet", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			ss := args.Get(1).(*appsv1.StatefulSet)
+			gotPodAnnotations = ss.Spec.Template.ObjectMeta.Annotations
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
+
+		assert.Equal(test.expectedPodAnnotations, gotPodAnnotations)
+		assert.NoError(err)
+	}
+}
+
+func TestSentinelDeploymentPodAnnotations(t *testing.T) {
+	tests := []struct {
+		name                   string
+		givenPodAnnotations    map[string]string
+		expectedPodAnnotations map[string]string
+	}{
+		{
+			name:                   "PodAnnotations was not defined",
+			givenPodAnnotations:    nil,
+			expectedPodAnnotations: nil,
+		},
+		{
+			name: "PodAnnotations is defined",
+			givenPodAnnotations: map[string]string{
+				"some":               "annotation",
+				"path/to/annotation": "here",
+			},
+			expectedPodAnnotations: map[string]string{
+				"some":               "annotation",
+				"path/to/annotation": "here",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		// Generate a default RedisFailover and attaching the required annotations
+		rf := generateRF()
+		rf.Spec.Sentinel.PodAnnotations = test.givenPodAnnotations
+
+		gotPodAnnotations := map[string]string{}
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetDeployment", namespace, mock.Anything).Once().Return(nil, notFound("deployments", name))
+		ms.On("CreateOrUpdateDeployment", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			d := args.Get(1).(*appsv1.Deployment)
+			gotPodAnnotations = d.Spec.Template.ObjectMeta.Annotations
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureSentinelDeployment(rf, nil, []metav1.OwnerReference{})
+
+		assert.Equal(test.expectedPodAnnotations, gotPodAnnotations)
+		assert.NoError(err)
+	}
+}
+
+func TestRedisStatefulSetServiceAccountName(t *testing.T) {
+	tests := []struct {
+		name                       string
+		givenServiceAccountName    string
+		expectedServiceAccountName string
+	}{
+		{
+			name:                       "ServiceAccountName was not defined",
+			givenServiceAccountName:    "",
+			expectedServiceAccountName: "",
+		},
+		{
+			name:                       "ServiceAccountName is defined",
+			givenServiceAccountName:    "redis-sa",
+			expectedServiceAccountName: "redis-sa",
+		},
+	}
+
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		// Generate a default RedisFailover and attaching the required Service Account
+		rf := generateRF()
+		rf.Spec.Redis.ServiceAccountName = test.givenServiceAccountName
+
+		gotServiceAccountName := ""
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetStatefulSet", namespace, mock.Anything).Once().Return(nil, notFound("statefulsets", name))
+		ms.On("CreateOrUpdateStatefulSet", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			ss := args.Get(1).(*appsv1.StatefulSet)
+			gotServiceAccountName = ss.Spec.Template.Spec.ServiceAccountName
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
+
+		assert.Equal(test.expectedServiceAccountName, gotServiceAccountName)
+		assert.NoError(err)
+	}
+}
+
+func TestSentinelDeploymentServiceAccountName(t *testing.T) {
+	tests := []struct {
+		name                       string
+		givenServiceAccountName    string
+		expectedServiceAccountName string
+	}{
+		{
+			name:                       "ServiceAccountName was not defined",
+			givenServiceAccountName:    "",
+			expectedServiceAccountName: "",
+		},
+		{
+			name:                       "ServiceAccountName is defined",
+			givenServiceAccountName:    "sentinel-sa",
+			expectedServiceAccountName: "sentinel-sa",
+		},
+	}
+
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		// Generate a default RedisFailover and attaching the required Service Account
+		rf := generateRF()
+		rf.Spec.Sentinel.ServiceAccountName = test.givenServiceAccountName
+
+		gotServiceAccountName := ""
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetDeployment", namespace, mock.Anything).Once().Return(nil, notFound("deployments", name))
+		ms.On("CreateOrUpdateDeployment", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			d := args.Get(1).(*appsv1.Deployment)
+			gotServiceAccountName = d.Spec.Template.Spec.ServiceAccountName
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureSentinelDeployment(rf, nil, []metav1.OwnerReference{})
+
+		assert.Equal(test.expectedServiceAccountName, gotServiceAccountName)
+		assert.NoError(err)
+	}
+}
+
+func TestSentinelService(t *testing.T) {
+	tests := []struct {
+		name            string
+		rfName          string
+		rfNamespace     string
+		rfLabels        map[string]string
+		rfAnnotations   map[string]string
+		expectedService corev1.Service
+	}{
+		{
+			name: "with defaults",
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sentinelName,
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "sentinel",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "sentinel",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "sentinel",
+							Port:       26379,
+							TargetPort: intstr.FromInt(26379),
+							Protocol:   "TCP",
+						},
+					},
+				},
+			},
+		},
+		{
+			name:   "with Name provided",
+			rfName: "custom-name",
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rfs-custom-name",
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "sentinel",
+						"app.kubernetes.io/name":      "custom-name",
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "sentinel",
+						"app.kubernetes.io/name":      "custom-name",
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "sentinel",
+							Port:       26379,
+							TargetPort: intstr.FromInt(26379),
+							Protocol:   "TCP",
+						},
+					},
+				},
+			},
+		},
+		{
+			name:        "with Namespace provided",
+			rfNamespace: "custom-namespace",
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sentinelName,
+					Namespace: "custom-namespace",
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "sentinel",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "sentinel",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "sentinel",
+							Port:       26379,
+							TargetPort: intstr.FromInt(26379),
+							Protocol:   "TCP",
+						},
+					},
+				},
+			},
+		},
+		{
+			name:     "with Labels provided",
+			rfLabels: map[string]string{"some": "label"},
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sentinelName,
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "sentinel",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"some":                        "label",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "sentinel",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "sentinel",
+							Port:       26379,
+							TargetPort: intstr.FromInt(26379),
+							Protocol:   "TCP",
+						},
+					},
+				},
+			},
+		},
+		{
+			name:          "with Annotations provided",
+			rfAnnotations: map[string]string{"some": "annotation"},
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sentinelName,
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "sentinel",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					Annotations: map[string]string{"some": "annotation"},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "sentinel",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "sentinel",
+							Port:       26379,
+							TargetPort: intstr.FromInt(26379),
+							Protocol:   "TCP",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			// Generate a default RedisFailover and attaching the required annotations
+			rf := generateRF()
+			if test.rfName != "" {
+				rf.Name = test.rfName
+			}
+			if test.rfNamespace != "" {
+				rf.Namespace = test.rfNamespace
+			}
+			rf.Spec.Sentinel.ServiceAnnotations = test.rfAnnotations
+
+			generatedService := corev1.Service{}
+
+			ms := &mK8SService.Services{}
+			ms.On("CreateOrUpdateService", rf.Namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+				s := args.Get(1).(*corev1.Service)
+				generatedService = *s
+			}).Return(nil)
+
+			client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+			err := client.EnsureSentinelService(rf, test.rfLabels, []metav1.OwnerReference{{Name: "testing"}})
+
+			assert.Equal(test.expectedService, generatedService)
+			assert.NoError(err)
+		})
+	}
+}
+
+func TestRedisService(t *testing.T) {
+	tests := []struct {
+		name            string
+		rfName          string
+		rfNamespace     string
+		rfLabels        map[string]string
+		rfAnnotations   map[string]string
+		expectedService corev1.Service
+	}{
+		{
+			name: "with defaults",
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      redisName,
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					Annotations: map[string]string{
+						"prometheus.io/scrape": "true",
+						"prometheus.io/path":   "/metrics",
+						"prometheus.io/port":   "http",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type:      corev1.ServiceTypeClusterIP,
+					ClusterIP: corev1.ClusterIPNone,
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:     "http-metrics",
+							Port:     9121,
+							Protocol: corev1.ProtocolTCP,
+						},
+					},
+				},
+			},
+		},
+		{
+			name:   "with Name provided",
+			rfName: "custom-name",
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rfr-custom-name",
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      "custom-name",
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					Annotations: map[string]string{
+						"prometheus.io/scrape": "true",
+						"prometheus.io/path":   "/metrics",
+						"prometheus.io/port":   "http",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type:      corev1.ServiceTypeClusterIP,
+					ClusterIP: corev1.ClusterIPNone,
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      "custom-name",
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:     "http-metrics",
+							Port:     9121,
+							Protocol: corev1.ProtocolTCP,
+						},
+					},
+				},
+			},
+		},
+		{
+			name:        "with Namespace provided",
+			rfNamespace: "custom-namespace",
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      redisName,
+					Namespace: "custom-namespace",
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					Annotations: map[string]string{
+						"prometheus.io/scrape": "true",
+						"prometheus.io/path":   "/metrics",
+						"prometheus.io/port":   "http",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type:      corev1.ServiceTypeClusterIP,
+					ClusterIP: corev1.ClusterIPNone,
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:     "http-metrics",
+							Port:     9121,
+							Protocol: corev1.ProtocolTCP,
+						},
+					},
+				},
+			},
+		},
+		{
+			name:     "with Labels provided",
+			rfLabels: map[string]string{"some": "label"},
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      redisName,
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"some":                        "label",
+					},
+					Annotations: map[string]string{
+						"prometheus.io/scrape": "true",
+						"prometheus.io/path":   "/metrics",
+						"prometheus.io/port":   "http",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type:      corev1.ServiceTypeClusterIP,
+					ClusterIP: corev1.ClusterIPNone,
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:     "http-metrics",
+							Port:     9121,
+							Protocol: corev1.ProtocolTCP,
+						},
+					},
+				},
+			},
+		},
+		{
+			name:          "with Annotations provided",
+			rfAnnotations: map[string]string{"some": "annotation"},
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      redisName,
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					Annotations: map[string]string{
+						"prometheus.io/scrape": "true",
+						"prometheus.io/path":   "/metrics",
+						"prometheus.io/port":   "http",
+						"some":                 "annotation",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type:      corev1.ServiceTypeClusterIP,
+					ClusterIP: corev1.ClusterIPNone,
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:     "http-metrics",
+							Port:     9121,
+							Protocol: corev1.ProtocolTCP,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			// Generate a default RedisFailover and attaching the required annotations
+			rf := generateRF()
+			if test.rfName != "" {
+				rf.Name = test.rfName
+			}
+			if test.rfNamespace != "" {
+				rf.Namespace = test.rfNamespace
+			}
+			rf.Spec.Redis.ServiceAnnotations = test.rfAnnotations
+
+			generatedService := corev1.Service{}
+
+			ms := &mK8SService.Services{}
+			ms.On("CreateOrUpdateService", rf.Namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+				s := args.Get(1).(*corev1.Service)
+				generatedService = *s
+			}).Return(nil)
+
+			client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+			err := client.EnsureRedisService(rf, test.rfLabels, []metav1.OwnerReference{{Name: "testing"}})
+
+			assert.Equal(test.expectedService, generatedService)
+			assert.NoError(err)
+		})
+	}
+}
+
+func TestHaproxyService(t *testing.T) {
+	haproxyName := "rfrm-haproxy-test"
+	portName := "redis-master"
+	defaultRedisPort := redisfailoverv1.Port(6379)
+	customClusterIP := "10.1.1.100"
+	tests := []struct {
+		name            string
+		rfName          string
+		rfNamespace     string
+		rfLabels        map[string]string
+		rfAnnotations   map[string]string
+		rfRedisPort     redisfailoverv1.Port
+		haproxy         redisfailoverv1.HaproxySettings
+		expectedService corev1.Service
+	}{
+		{
+			name:        "with defaults",
+			rfRedisPort: defaultRedisPort,
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "haproxy",
+						"app.kubernetes.io/name":      "test",
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "master",
+					},
+					Name:      haproxyName,
+					Namespace: namespace,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type: corev1.ServiceTypeClusterIP,
+					Selector: map[string]string{
+						"app.kubernetes.io/component":                      "haproxy",
+						"app.kubernetes.io/name":                           "test",
+						"app.kubernetes.io/part-of":                        "redis-failover",
+						"redisfailovers.databases.spotahome.com/component": "haproxy",
+						"redisfailovers-role":                              "master",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       portName,
+							Port:       defaultRedisPort.ToInt32(),
+							TargetPort: intstr.FromInt(int(defaultRedisPort)),
+							Protocol:   corev1.ProtocolTCP,
+						},
+					},
+				},
+			},
+		},
+		{
+			name:        "with custom ClusterIP",
+			rfRedisPort: defaultRedisPort,
+			haproxy: redisfailoverv1.HaproxySettings{
+				Service: &redisfailoverv1.ServiceSettings{
+					ClusterIP: customClusterIP,
+				},
+			},
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "haproxy",
+						"app.kubernetes.io/name":      "test",
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "master",
+					},
+					Name:      haproxyName,
+					Namespace: namespace,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type:      corev1.ServiceTypeClusterIP,
+					ClusterIP: customClusterIP,
+					Selector: map[string]string{
+						"app.kubernetes.io/component":                      "haproxy",
+						"app.kubernetes.io/name":                           "test",
+						"app.kubernetes.io/part-of":                        "redis-failover",
+						"redisfailovers.databases.spotahome.com/component": "haproxy",
+						"redisfailovers-role":                              "master",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       portName,
+							Port:       defaultRedisPort.ToInt32(),
+							TargetPort: intstr.FromInt(int(defaultRedisPort)),
+							Protocol:   corev1.ProtocolTCP,
+						},
+					},
+				},
+			},
+		},
+		{
+			name:        "with Exporter",
+			rfRedisPort: defaultRedisPort,
+			haproxy: redisfailoverv1.HaproxySettings{
+				Exporter: &redisfailoverv1.HaproxyExporterSettings{
+					Enabled: true,
+					Port:    redisfailoverv1.DefaultHaproxyExporterPort,
+				},
+			},
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "haproxy",
+						"app.kubernetes.io/name":      "test",
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "master",
+					},
+					Name:      haproxyName,
+					Namespace: namespace,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type: corev1.ServiceTypeClusterIP,
+					Selector: map[string]string{
+						"app.kubernetes.io/component":                      "haproxy",
+						"app.kubernetes.io/name":                           "test",
+						"app.kubernetes.io/part-of":                        "redis-failover",
+						"redisfailovers.databases.spotahome.com/component": "haproxy",
+						"redisfailovers-role":                              "master",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       portName,
+							Port:       defaultRedisPort.ToInt32(),
+							TargetPort: intstr.FromInt(int(defaultRedisPort)),
+							Protocol:   corev1.ProtocolTCP,
+						},
+						{
+							Name:       redisfailoverv1.DefaultHaproxyExporterPortName,
+							Port:       redisfailoverv1.DefaultHaproxyExporterPort,
+							TargetPort: intstr.FromString(redisfailoverv1.DefaultHaproxyExporterPortName),
+							Protocol:   corev1.ProtocolTCP,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			// Generate a default RedisFailover and attaching the required annotations
+			rf := generateRF()
+			if test.rfName != "" {
+				rf.Name = test.rfName
+			}
+			if test.rfNamespace != "" {
+				rf.Namespace = test.rfNamespace
+			}
+			rf.Spec.Redis.ServiceAnnotations = test.rfAnnotations
+			rf.Spec.Redis.Port = test.rfRedisPort
+			rf.Spec.Haproxy = &test.haproxy
+
+			generatedService := corev1.Service{}
+
+			ms := &mK8SService.Services{}
+			ms.On("CreateOrUpdateService", rf.Namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+				s := args.Get(1).(*corev1.Service)
+				generatedService = *s
+			}).Return(nil)
+
+			client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+			err := client.EnsureHAProxyRedisMasterService(rf, test.rfLabels, []metav1.OwnerReference{{Name: "testing"}})
+
+			assert.Equal(test.expectedService, generatedService)
+			assert.NoError(err)
+		})
+	}
+}
+
+func TestHaproxyDeploymentRedisPassword(t *testing.T) {
+	tests := []struct {
+		name       string
+		secretPath string
+		wantEnv    bool
+	}{
+		{name: "carries REDIS_PASSWORD when the failover has a password", secretPath: "redis-auth", wantEnv: true},
+		{name: "carries no env when it does not", secretPath: "", wantEnv: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			rf := generateRF()
+			rf.Spec.Auth.SecretPath = test.secretPath
+			rf.Spec.Haproxy = &redisfailoverv1.HaproxySettings{Replicas: 2}
+
+			var got *appsv1.Deployment
+			ms := &mK8SService.Services{}
+			// EnsureHAProxyRedisMasterDeployment refuses to proceed without the
+			// config checksum it stamps onto the pod template.
+			ms.On("GetConfigMap", namespace, mock.Anything).Once().Return(&corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{"checksum/haproxy-cfg": "deadbeef"},
+				},
+			}, nil)
+			// No existing Deployment, so the spec-checksum short circuit is
+			// skipped. It is also read a second time, by the check that holds
+			// HAProxy on its current password until Redis has taken the new one,
+			// which distinguishes an absent proxy from a failed read and so
+			// needs a real NotFound rather than any error saying "not found".
+			ms.On("GetDeployment", namespace, mock.Anything).Return(nil, notFound("deployments", rfservice.GetHaproxyMasterName(rf)))
+			// The ordering check reads the Redis pods whether or not there is a
+			// password, since giving one up has to wait on Redis just as taking
+			// one does.
+			ms.On("GetStatefulSetPods", namespace, mock.Anything).Return(&corev1.PodList{}, nil)
+			if test.secretPath != "" {
+				ms.On("GetSecret", namespace, test.secretPath).Return(&corev1.Secret{
+					Data: map[string][]byte{"password": []byte("s3cr3tpass")},
+				}, nil)
+			}
+			ms.On("CreateOrUpdateDeployment", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+				got = args.Get(1).(*appsv1.Deployment)
+			}).Return(nil)
+
+			client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+			err := client.EnsureHAProxyRedisMasterDeployment(rf, nil, []metav1.OwnerReference{})
+			assert.NoError(err)
+
+			env := got.Spec.Template.Spec.Containers[0].Env
+			if !test.wantEnv {
+				assert.Empty(env, "haproxy should get no environment without a password")
+				return
+			}
+
+			assert.Len(env, 1)
+			assert.Equal("REDIS_PASSWORD", env[0].Name)
+			// From the Secret, never an inline value -- the whole point of
+			// send-lf in the config is to keep the password out of the
+			// ConfigMap, which a literal here would undo.
+			assert.Empty(env[0].Value)
+			assert.Equal(test.secretPath, env[0].ValueFrom.SecretKeyRef.Name)
+			assert.Equal("password", env[0].ValueFrom.SecretKeyRef.Key)
+		})
+	}
+}
+
+const passwordKey = "checksum/redis-password"
+
+func redisPodWith(name, digest string) corev1.Pod {
+	annotations := map[string]string{}
+	if digest != "" {
+		annotations[passwordKey] = digest
+	}
+	return corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: annotations},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
+func haproxyDeploymentWith(digest string) *appsv1.Deployment {
+	annotations := map[string]string{}
+	if digest != "" {
+		annotations[passwordKey] = digest
+	}
+	return &appsv1.Deployment{
+		Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{Annotations: annotations},
+		}},
+	}
+}
+
+// ensureHaproxy runs the HAProxy deployment ensure against a failover with the
+// given Redis pods and running Deployment, and returns the Deployment it wrote,
+// or nil when it wrote none.
+//
+// Whether it writes is the question these tests ask. Writing the Deployment is
+// what restarts the proxy, and restarting it is what moves it onto a different
+// password. Asserting on the digest it stamps instead would miss a proxy that
+// is restarted for some other reason, which is how adding auth.secretPath used
+// to get past this: it changes the pod spec, not just the digest.
+func ensureHaproxy(t *testing.T, secretPath string, pods []corev1.Pod, running *appsv1.Deployment, getErr error) (*appsv1.Deployment, error) {
+	t.Helper()
+
+	rf := generateRF()
+	rf.Spec.Auth.SecretPath = secretPath
+	rf.Spec.Haproxy = &redisfailoverv1.HaproxySettings{Replicas: 2}
+
+	var got *appsv1.Deployment
+	ms := &mK8SService.Services{}
+	ms.On("GetConfigMap", namespace, mock.Anything).Once().Return(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{"checksum/haproxy-cfg": "deadbeef"},
+		},
+	}, nil)
+	if secretPath != "" {
+		ms.On("GetSecret", namespace, secretPath).Return(&corev1.Secret{
+			Data: map[string][]byte{"password": []byte("s3cr3tpass")},
+		}, nil)
+	}
+	ms.On("GetStatefulSetPods", namespace, mock.Anything).Return(&corev1.PodList{Items: pods}, nil)
+	if getErr != nil {
+		ms.On("GetDeployment", namespace, mock.Anything).Return(nil, getErr)
+	} else {
+		ms.On("GetDeployment", namespace, mock.Anything).Return(running, nil)
+	}
+	ms.On("CreateOrUpdateDeployment", namespace, mock.Anything).Run(func(args mock.Arguments) {
+		got = args.Get(1).(*appsv1.Deployment)
+	}).Return(nil)
+
+	client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+	err := client.EnsureHAProxyRedisMasterDeployment(rf, nil, []metav1.OwnerReference{})
+	return got, err
+}
+
+// HAProxy reads REDIS_PASSWORD when its pod starts, so rewriting its Deployment
+// is what moves it onto a different password. That has to come after Redis:
+// HAProxy authenticates its health check, so a proxy whose configuration
+// disagrees with a Redis that is up and answering fails every backend and
+// leaves the master Service with nothing to route to.
+func TestHaproxyWaitsForRedisBeforeTakingANewPassword(t *testing.T) {
+	current := redisPasswordDigest(namespace, name, "s3cr3tpass")
+
+	t.Run("writes once every Redis pod carries the current password", func(t *testing.T) {
+		got, err := ensureHaproxy(t, "redis-auth",
+			[]corev1.Pod{redisPodWith("rfr-test-0", current), redisPodWith("rfr-test-1", current)},
+			haproxyDeploymentWith("older-digest"), nil)
+
+		assert.NoError(t, err)
+		if assert.NotNil(t, got, "the proxy has to follow Redis onto the new password") {
+			assert.Equal(t, current, got.Spec.Template.Annotations[passwordKey])
+		}
+	})
+
+	t.Run("holds while a Redis pod still carries the old password", func(t *testing.T) {
+		got, err := ensureHaproxy(t, "redis-auth",
+			[]corev1.Pod{redisPodWith("rfr-test-0", current), redisPodWith("rfr-test-1", "older-digest")},
+			haproxyDeploymentWith("older-digest"), nil)
+
+		assert.NoError(t, err)
+		assert.Nil(t, got, "restarting here would authenticate against a backend still on the old password")
+	})
+
+	t.Run("holds when the failover gains a password its pods do not have", func(t *testing.T) {
+		// Adding auth.secretPath puts REDIS_PASSWORD into the HAProxy pod spec,
+		// so the Deployment differs whether or not the digest moves. Nothing
+		// about the digest can hold this back on its own.
+		got, err := ensureHaproxy(t, "redis-auth",
+			[]corev1.Pod{redisPodWith("rfr-test-0", ""), redisPodWith("rfr-test-1", "")},
+			haproxyDeploymentWith(""), nil)
+
+		assert.NoError(t, err)
+		assert.Nil(t, got, "the proxy must not authenticate against a Redis that wants no password")
+	})
+
+	t.Run("creates the proxy when none is running", func(t *testing.T) {
+		// Nothing to hold back, and holding would mean never creating it.
+		got, err := ensureHaproxy(t, "redis-auth",
+			[]corev1.Pod{redisPodWith("rfr-test-0", "older-digest")},
+			nil, notFound("deployments", "rfrm-haproxy-test"))
+
+		assert.NoError(t, err)
+		assert.NotNil(t, got)
+	})
+
+	t.Run("abandons the pass when the running Deployment cannot be read", func(t *testing.T) {
+		// A failed read is not "no proxy running yet", and guessing is what
+		// restarts HAProxy ahead of Redis.
+		got, err := ensureHaproxy(t, "redis-auth",
+			[]corev1.Pod{redisPodWith("rfr-test-0", current)},
+			nil, errors.New("etcdserver: request timed out"))
+
+		assert.Error(t, err)
+		assert.Nil(t, got)
+	})
+}
+
+// Giving up a password needs the same ordering. Until Redis has restarted
+// without requirepass its backends still demand one, so a proxy that has
+// already dropped it fails every health check.
+func TestHaproxyWaitsForRedisBeforeGivingUpAPassword(t *testing.T) {
+	t.Run("holds while a Redis pod still requires a password", func(t *testing.T) {
+		got, err := ensureHaproxy(t, "",
+			[]corev1.Pod{redisPodWith("rfr-test-0", "older-digest"), redisPodWith("rfr-test-1", "")},
+			haproxyDeploymentWith("older-digest"), nil)
+
+		assert.NoError(t, err)
+		assert.Nil(t, got, "the proxy must keep the password its backends still demand")
+	})
+
+	t.Run("writes once no Redis pod requires one", func(t *testing.T) {
+		got, err := ensureHaproxy(t, "",
+			[]corev1.Pod{redisPodWith("rfr-test-0", ""), redisPodWith("rfr-test-1", "")},
+			haproxyDeploymentWith("older-digest"), nil)
+
+		assert.NoError(t, err)
+		if assert.NotNil(t, got) {
+			assert.NotContains(t, got.Spec.Template.Annotations, passwordKey)
+		}
+	})
+}
+
+// A pod on its way out is not going to take a new password, so waiting for it
+// waits forever. A node failure can leave a pod terminating indefinitely, and
+// holding the proxy back that whole time leaves it authenticating with a
+// password its backends have already replaced.
+func TestHaproxyIgnoresRedisPodsOnTheirWayOut(t *testing.T) {
+	current := redisPasswordDigest(namespace, name, "s3cr3tpass")
+
+	leaving := redisPodWith("rfr-test-1", "older-digest")
+	leaving.ObjectMeta.DeletionTimestamp = &metav1.Time{Time: time.Unix(0, 0)}
+
+	got, err := ensureHaproxy(t, "redis-auth",
+		[]corev1.Pod{redisPodWith("rfr-test-0", current), leaving},
+		haproxyDeploymentWith("older-digest"), nil)
+
+	assert.NoError(t, err)
+	if assert.NotNil(t, got, "a terminating pod must not hold the proxy back") {
+		assert.Equal(t, current, got.Spec.Template.Annotations[passwordKey])
+	}
+}
+
+func TestGenerateHaproxyConfig(t *testing.T) {
+	tests := []struct {
+		name      string
+		rf        *redisfailoverv1.RedisFailover
+		bootstrap bool
+		// mustContain holds literal config text, for lines worth pinning
+		// exactly; mustMatch and mustNotMatch hold regular expressions, for
+		// everything that only has to be present, absent or in order.
+		mustContain  []string
+		mustMatch    []string
+		mustNotMatch []string
+	}{
+		{
+			name: "returns CustomConfig when provided",
+			rf: &redisfailoverv1.RedisFailover{
+				Spec: redisfailoverv1.RedisFailoverSpec{
+					Haproxy: &redisfailoverv1.HaproxySettings{
+						CustomConfig: "custom config here",
+					},
+				},
+			},
+			mustMatch: []string{"custom config here"},
+		},
+		{
+			name: "includes exporter block when enabled",
+			rf: &redisfailoverv1.RedisFailover{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "test-ns"},
+				Spec: redisfailoverv1.RedisFailoverSpec{
+					Redis: redisfailoverv1.RedisSettings{
+						Port:     6379,
+						Replicas: 3,
+					},
+					Haproxy: &redisfailoverv1.HaproxySettings{
+						Exporter: &redisfailoverv1.HaproxyExporterSettings{
+							Enabled: true,
+							Port:    9101,
+						},
+					},
+				},
+			},
+			mustMatch: []string{
+				"frontend prometheus",
+				"bind :9101",
+			},
+		},
+		{
+			name: "includes an active redis-master block when not bootstrapping",
+			rf: &redisfailoverv1.RedisFailover{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "test-ns", Name: "expected-name"},
+				Spec: redisfailoverv1.RedisFailoverSpec{
+					Redis: redisfailoverv1.RedisSettings{
+						Port:     6379,
+						Replicas: 3,
+					},
+					Haproxy: &redisfailoverv1.HaproxySettings{},
+				},
+			},
+			mustMatch: []string{
+				`frontend redis-master`,
+				`server-template redis 3 _redis\._tcp\.redis-expected-name\.test-ns\.svc\.cluster\.local:6379`,
+			},
+		},
+		{
+			name: "authenticates the health check when the failover has a password",
+			rf: &redisfailoverv1.RedisFailover{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "test-ns", Name: "expected-name"},
+				Spec: redisfailoverv1.RedisFailoverSpec{
+					Redis: redisfailoverv1.RedisSettings{
+						Port:     6379,
+						Replicas: 3,
+					},
+					Haproxy: &redisfailoverv1.HaproxySettings{},
+					Auth:    redisfailoverv1.AuthSettings{SecretPath: "redis-auth"},
+				},
+			},
+			// Both `send-lf` and the length-prefixed AUTH break silently when
+			// simplified, so pin the whole line.
+			mustContain: []string{
+				`  tcp-check send-lf *2\r\n$4\r\nAUTH\r\n$%[env(REDIS_PASSWORD),length]\r\n%[env(REDIS_PASSWORD)]\r\n
+  tcp-check expect string +OK`,
+			},
+			mustMatch: []string{
+				// and it has to precede the role check it exists to unblock
+				`(?s)AUTH.*tcp-check send info`,
+			},
+			mustNotMatch: []string{
+				// The Secret is referenced through the pod environment, so
+				// neither its name nor the password it holds belongs in a
+				// ConfigMap that anyone with `get configmaps` can read.
+				`redis-auth`,
+			},
+		},
+		{
+			name: "leaves the health check unauthenticated when there is no password",
+			rf: &redisfailoverv1.RedisFailover{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "test-ns", Name: "expected-name"},
+				Spec: redisfailoverv1.RedisFailoverSpec{
+					Redis: redisfailoverv1.RedisSettings{
+						Port:     6379,
+						Replicas: 3,
+					},
+					Haproxy: &redisfailoverv1.HaproxySettings{},
+				},
+			},
+			mustMatch: []string{`tcp-check send info\\ replication`},
+			mustNotMatch: []string{
+				// Named as the config directive and the variable rather than
+				// as the bare word AUTH, which any future comment could carry.
+				`tcp-check send-lf`,
+				`REDIS_PASSWORD`,
+			},
+		},
+		{
+			name: "includes an administratively disabled redis-master block when bootstrapping",
+			rf: &redisfailoverv1.RedisFailover{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "test-ns", Name: "expected-name"},
+				Spec: redisfailoverv1.RedisFailoverSpec{
+					Redis: redisfailoverv1.RedisSettings{
+						Port:     6379,
+						Replicas: 3,
+					},
+					Haproxy: &redisfailoverv1.HaproxySettings{},
+				},
+			},
+			bootstrap: true,
+			mustNotMatch: []string{
+				`frontend redis-master`,
+				`server-template redis 3 _redis\._tcp\.redis-expected-name\.test-ns\.svc\.cluster\.local:6379`,
+				`(?m)^\s*hold\s+\w+\s+\d+\s*$`,
+			},
+		},
+		{
+			// A bare number is milliseconds, so a missing unit turns a ten second
+			// grace into ten milliseconds and an NXDOMAIN blip empties the backend.
+			name: "gives every resolver hold an explicit unit",
+			rf: &redisfailoverv1.RedisFailover{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "test-ns", Name: "expected-name"},
+				Spec: redisfailoverv1.RedisFailoverSpec{
+					Redis: redisfailoverv1.RedisSettings{
+						Port:     6379,
+						Replicas: 3,
+					},
+					Haproxy: &redisfailoverv1.HaproxySettings{},
+				},
+			},
+			mustContain: []string{"hold nx 10s"},
+			// Catches the bug class rather than the single line: any hold whose
+			// value ends in a bare digit carries no unit.
+			mustNotMatch: []string{`(?m)^\s*hold\s+\w+\s+\d+\s*$`},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rf := *test.rf // shallow copy
+
+			cfg := rfservice.GenerateHaproxyConfig(&rf, test.bootstrap)
+
+			for _, want := range test.mustContain {
+				if !strings.Contains(cfg, want) {
+					t.Errorf("expected config to contain:\n%s\nConfig:\n%s", want, cfg)
+				}
+			}
+
+			for _, pattern := range test.mustMatch {
+				re := regexp.MustCompile(pattern)
+				if !re.MatchString(cfg) {
+					t.Errorf("expected config to match pattern %q\nConfig:\n%s", pattern, cfg)
+				}
+			}
+
+			for _, pattern := range test.mustNotMatch {
+				re := regexp.MustCompile(pattern)
+				if re.MatchString(cfg) {
+					t.Errorf("expected config NOT to match pattern %q\nConfig:\n%s", pattern, cfg)
+				}
+			}
+		})
+	}
+}
+
+func TestSentinelNetworkPolicy(t *testing.T) {
+	tests := []struct {
+		name                            string
+		rfName                          string
+		rfNamespace                     string
+		rfSentinelPort                  int
+		rfNetworkPolicyNamespaceEntries []redisfailoverv1.NetworkPolicyNamespaceEntry
+		rfLabels                        map[string]string
+		expected                        networkingv1.NetworkPolicy
+	}{
+		{
+			name: "with defaults",
+			rfNetworkPolicyNamespaceEntries: []redisfailoverv1.NetworkPolicyNamespaceEntry{
+				{
+					MatchLabelKey:   "app.kubernetes.io/instance",
+					MatchLabelValue: namespace,
+				},
+			},
+			expected: networkingv1.NetworkPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rfs-np-" + name,
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "sentinel",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					Annotations: nil,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: networkingv1.NetworkPolicySpec{
+					PodSelector: metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							"redisfailovers.databases.spotahome.com/component": "sentinel",
+							"redisfailovers.databases.spotahome.com/name":      name,
+						},
+					},
+					Ingress: []networkingv1.NetworkPolicyIngressRule{
+						{
+							From: []networkingv1.NetworkPolicyPeer{
+								{
+									NamespaceSelector: &metav1.LabelSelector{
+										MatchLabels: map[string]string{
+											"app.kubernetes.io/instance": namespace,
+										},
+									},
+								},
+							},
+							Ports: []networkingv1.NetworkPolicyPort{
+								{
+									Port: &intstr.IntOrString{
+										IntVal: 26379,
+										Type:   intstr.Int,
+									},
+								},
+							},
+						},
+					},
+					Egress: []networkingv1.NetworkPolicyEgressRule{
+						{
+							To: []networkingv1.NetworkPolicyPeer{
+								{
+									PodSelector: &metav1.LabelSelector{
+										MatchLabels: map[string]string{
+											"redisfailovers.databases.spotahome.com/name": name,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:           "with custom sentinel Port",
+			rfSentinelPort: 17781,
+			rfNetworkPolicyNamespaceEntries: []redisfailoverv1.NetworkPolicyNamespaceEntry{
+				{
+					MatchLabelKey:   "app.kubernetes.io/instance",
+					MatchLabelValue: namespace,
+				},
+			},
+			expected: networkingv1.NetworkPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rfs-np-" + name,
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "sentinel",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					Annotations: nil,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: networkingv1.NetworkPolicySpec{
+					PodSelector: metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							"redisfailovers.databases.spotahome.com/component": "sentinel",
+							"redisfailovers.databases.spotahome.com/name":      name,
+						},
+					},
+					Ingress: []networkingv1.NetworkPolicyIngressRule{
+						{
+							From: []networkingv1.NetworkPolicyPeer{
+								{
+									NamespaceSelector: &metav1.LabelSelector{
+										MatchLabels: map[string]string{
+											"app.kubernetes.io/instance": namespace,
+										},
+									},
+								},
+							},
+							Ports: []networkingv1.NetworkPolicyPort{
+								{
+									Port: &intstr.IntOrString{
+										IntVal: 17781,
+										Type:   intstr.Int,
+									},
+								},
+							},
+						},
+					},
+					Egress: []networkingv1.NetworkPolicyEgressRule{
+						{
+							To: []networkingv1.NetworkPolicyPeer{
+								{
+									PodSelector: &metav1.LabelSelector{
+										MatchLabels: map[string]string{
+											"redisfailovers.databases.spotahome.com/name": name,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "with custom NetorkPolicyNamespaceEntries",
+			rfNetworkPolicyNamespaceEntries: []redisfailoverv1.NetworkPolicyNamespaceEntry{
+				{
+					MatchLabelKey:   "app.kubernetes.io/instance",
+					MatchLabelValue: namespace,
+				},
+				{
+					MatchLabelKey:   "app.kubernetes.io/instance",
+					MatchLabelValue: "extra-namespace",
+				},
+			},
+			expected: networkingv1.NetworkPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rfs-np-" + name,
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "sentinel",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+					},
+					Annotations: nil,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: networkingv1.NetworkPolicySpec{
+					PodSelector: metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							"redisfailovers.databases.spotahome.com/component": "sentinel",
+							"redisfailovers.databases.spotahome.com/name":      name,
+						},
+					},
+					Ingress: []networkingv1.NetworkPolicyIngressRule{
+						{
+							From: []networkingv1.NetworkPolicyPeer{
+								{
+									NamespaceSelector: &metav1.LabelSelector{
+										MatchLabels: map[string]string{
+											"app.kubernetes.io/instance": namespace,
+										},
+									},
+								},
+								{
+									NamespaceSelector: &metav1.LabelSelector{
+										MatchLabels: map[string]string{
+											"app.kubernetes.io/instance": "extra-namespace",
+										},
+									},
+								},
+							},
+							Ports: []networkingv1.NetworkPolicyPort{
+								{
+									Port: &intstr.IntOrString{
+										IntVal: 26379,
+										Type:   intstr.Int,
+									},
+								},
+							},
+						},
+					},
+					Egress: []networkingv1.NetworkPolicyEgressRule{
+						{
+							To: []networkingv1.NetworkPolicyPeer{
+								{
+									PodSelector: &metav1.LabelSelector{
+										MatchLabels: map[string]string{
+											"redisfailovers.databases.spotahome.com/name": name,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			// Generate a default RedisFailover and attaching the required annotations
+			rf := generateRF()
+			if test.rfName != "" {
+				rf.Name = test.rfName
+			}
+			if test.rfNamespace != "" {
+				rf.Namespace = test.rfNamespace
+			}
+			if test.rfSentinelPort != 0 {
+				rf.Spec.Sentinel.Port = redisfailoverv1.Port(test.rfSentinelPort)
+			}
+			if test.rfNetworkPolicyNamespaceEntries != nil {
+				rf.Spec.NetworkPolicyNsList = test.rfNetworkPolicyNamespaceEntries
+			}
+
+			generated := networkingv1.NetworkPolicy{}
+
+			ms := &mK8SService.Services{}
+			ms.On("CreateOrUpdateNetworkPolicy", rf.Namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+				s := args.Get(1).(*networkingv1.NetworkPolicy)
+				generated = *s
+			}).Return(nil)
+
+			client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+			err := client.EnsureSentinelNetworkPolicy(rf, test.rfLabels, []metav1.OwnerReference{{Name: "testing"}})
+
+			assert.Equal(test.expected, generated)
+			assert.NoError(err)
+		})
+	}
+}
+
+func TestRedisMasterService(t *testing.T) {
+	tests := []struct {
+		name            string
+		rfName          string
+		rfNamespace     string
+		rfLabels        map[string]string
+		rfAnnotations   map[string]string
+		expectedService corev1.Service
+	}{
+		{
+			name: "with defaults",
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      masterName,
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "master",
+					},
+					Annotations: nil,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type: corev1.ServiceTypeClusterIP,
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "master",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "redis",
+							Port:       6379,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromString("redis"),
+						},
+					},
+				},
+			},
+		},
+		{
+			name:   "with Name provided",
+			rfName: "custom-name",
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rfrm-custom-name",
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      "custom-name",
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "master",
+					},
+					Annotations: nil,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type: corev1.ServiceTypeClusterIP,
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      "custom-name",
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "master",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "redis",
+							Port:       6379,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromString("redis"),
+						},
+					},
+				},
+			},
+		},
+		{
+			name:        "with Namespace provided",
+			rfNamespace: "custom-namespace",
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      masterName,
+					Namespace: "custom-namespace",
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "master",
+					},
+					Annotations: nil,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type: corev1.ServiceTypeClusterIP,
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "master",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "redis",
+							Port:       6379,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromString("redis"),
+						},
+					},
+				},
+			},
+		},
+		{
+			name:     "with Labels provided",
+			rfLabels: map[string]string{"some": "label"},
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      masterName,
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "master",
+						"some":                        "label",
+					},
+					Annotations: nil,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type: corev1.ServiceTypeClusterIP,
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "master",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "redis",
+							Port:       6379,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromString("redis"),
+						},
+					},
+				},
+			},
+		},
+		{
+			name:          "with Annotations provided",
+			rfAnnotations: map[string]string{"some": "annotation"},
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      masterName,
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "master",
+					},
+					Annotations: map[string]string{
+						"some": "annotation",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type: corev1.ServiceTypeClusterIP,
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "master",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "redis",
+							Port:       6379,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromString("redis"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			// Generate a default RedisFailover and attaching the required annotations
+			rf := generateRF()
+			if test.rfName != "" {
+				rf.Name = test.rfName
+			}
+			if test.rfNamespace != "" {
+				rf.Namespace = test.rfNamespace
+			}
+			rf.Spec.Redis.Port = 6379
+			rf.Spec.Redis.ServiceAnnotations = test.rfAnnotations
+
+			generatedMasterService := corev1.Service{}
+
+			ms := &mK8SService.Services{}
+			ms.On("CreateOrUpdateService", rf.Namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+				s := args.Get(1).(*corev1.Service)
+				generatedMasterService = *s
+			}).Return(nil)
+
+			client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+			err := client.EnsureRedisMasterService(rf, test.rfLabels, []metav1.OwnerReference{{Name: "testing"}})
+
+			assert.Equal(test.expectedService, generatedMasterService)
+			assert.NoError(err)
+		})
+	}
+}
+
+func TestRedisSlaveService(t *testing.T) {
+	tests := []struct {
+		name            string
+		rfName          string
+		rfNamespace     string
+		rfLabels        map[string]string
+		rfAnnotations   map[string]string
+		expectedService corev1.Service
+	}{
+		{
+			name: "with defaults",
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      slaveName,
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "slave",
+					},
+					Annotations: nil,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type: corev1.ServiceTypeClusterIP,
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "slave",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "redis",
+							Port:       6379,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromString("redis"),
+						},
+					},
+				},
+			},
+		},
+		{
+			name:   "with Name provided",
+			rfName: "custom-name",
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rfrs-custom-name",
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      "custom-name",
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "slave",
+					},
+					Annotations: nil,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type: corev1.ServiceTypeClusterIP,
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      "custom-name",
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "slave",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "redis",
+							Port:       6379,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromString("redis"),
+						},
+					},
+				},
+			},
+		},
+		{
+			name:        "with Namespace provided",
+			rfNamespace: "custom-namespace",
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      slaveName,
+					Namespace: "custom-namespace",
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "slave",
+					},
+					Annotations: nil,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type: corev1.ServiceTypeClusterIP,
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "slave",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "redis",
+							Port:       6379,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromString("redis"),
+						},
+					},
+				},
+			},
+		},
+		{
+			name:     "with Labels provided",
+			rfLabels: map[string]string{"some": "label"},
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      slaveName,
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "slave",
+						"some":                        "label",
+					},
+					Annotations: nil,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type: corev1.ServiceTypeClusterIP,
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "slave",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "redis",
+							Port:       6379,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromString("redis"),
+						},
+					},
+				},
+			},
+		},
+		{
+			name:          "with Annotations provided",
+			rfAnnotations: map[string]string{"some": "annotation"},
+			expectedService: corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      slaveName,
+					Namespace: namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "slave",
+					},
+					Annotations: map[string]string{
+						"some": "annotation",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Name: "testing",
+						},
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type: corev1.ServiceTypeClusterIP,
+					Selector: map[string]string{
+						"app.kubernetes.io/component": "redis",
+						"app.kubernetes.io/name":      name,
+						"app.kubernetes.io/part-of":   "redis-failover",
+						"redisfailovers-role":         "slave",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "redis",
+							Port:       6379,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromString("redis"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			// Generate a default RedisFailover and attaching the required annotations
+			rf := generateRF()
+			if test.rfName != "" {
+				rf.Name = test.rfName
+			}
+			if test.rfNamespace != "" {
+				rf.Namespace = test.rfNamespace
+			}
+			rf.Spec.Redis.Port = 6379
+			rf.Spec.Redis.ServiceAnnotations = test.rfAnnotations
+
+			generatedSlaveService := corev1.Service{}
+
+			ms := &mK8SService.Services{}
+			ms.On("CreateOrUpdateService", rf.Namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+				s := args.Get(1).(*corev1.Service)
+				generatedSlaveService = *s
+			}).Return(nil)
+
+			client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+			err := client.EnsureRedisSlaveService(rf, test.rfLabels, []metav1.OwnerReference{{Name: "testing"}})
+
+			assert.Equal(test.expectedService, generatedSlaveService)
+			assert.NoError(err)
+		})
+	}
+}
+
+func TestRedisHostNetworkAndDnsPolicy(t *testing.T) {
+	tests := []struct {
+		name                string
+		hostNetwork         bool
+		expectedHostNetwork bool
+		dnsPolicy           corev1.DNSPolicy
+		expectedDnsPolicy   corev1.DNSPolicy
+	}{
+		{
+			name:                "Default",
+			expectedHostNetwork: false,
+			expectedDnsPolicy:   corev1.DNSClusterFirst,
+		},
+		{
+			name:                "Custom",
+			hostNetwork:         true,
+			expectedHostNetwork: true,
+			dnsPolicy:           corev1.DNSClusterFirstWithHostNet,
+			expectedDnsPolicy:   corev1.DNSClusterFirstWithHostNet,
+		},
+	}
+
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		rf := generateRF()
+		rf.Spec.Redis.HostNetwork = test.hostNetwork
+		rf.Spec.Redis.DNSPolicy = test.dnsPolicy
+
+		var actualHostNetwork bool
+		var actualDnsPolicy corev1.DNSPolicy
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetStatefulSet", namespace, mock.Anything).Once().Return(nil, notFound("statefulsets", name))
+		ms.On("CreateOrUpdateStatefulSet", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			ss := args.Get(1).(*appsv1.StatefulSet)
+			actualHostNetwork = ss.Spec.Template.Spec.HostNetwork
+			actualDnsPolicy = ss.Spec.Template.Spec.DNSPolicy
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
+		assert.NoError(err)
+
+		assert.Equal(test.expectedHostNetwork, actualHostNetwork)
+		assert.Equal(test.expectedDnsPolicy, actualDnsPolicy)
+	}
+}
+
+func TestSentinelHostNetworkAndDnsPolicy(t *testing.T) {
+	tests := []struct {
+		name                string
+		hostNetwork         bool
+		expectedHostNetwork bool
+		dnsPolicy           corev1.DNSPolicy
+		expectedDnsPolicy   corev1.DNSPolicy
+	}{
+		{
+			name:                "Default",
+			expectedHostNetwork: false,
+			expectedDnsPolicy:   corev1.DNSClusterFirst,
+		},
+		{
+			name:                "Custom",
+			hostNetwork:         true,
+			expectedHostNetwork: true,
+			dnsPolicy:           corev1.DNSClusterFirstWithHostNet,
+			expectedDnsPolicy:   corev1.DNSClusterFirstWithHostNet,
+		},
+	}
+
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		rf := generateRF()
+		rf.Spec.Sentinel.HostNetwork = test.hostNetwork
+		rf.Spec.Sentinel.DNSPolicy = test.dnsPolicy
+
+		var actualHostNetwork bool
+		var actualDnsPolicy corev1.DNSPolicy
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetDeployment", namespace, mock.Anything).Once().Return(nil, notFound("deployments", name))
+		ms.On("CreateOrUpdateDeployment", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			d := args.Get(1).(*appsv1.Deployment)
+			actualHostNetwork = d.Spec.Template.Spec.HostNetwork
+			actualDnsPolicy = d.Spec.Template.Spec.DNSPolicy
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureSentinelDeployment(rf, nil, []metav1.OwnerReference{})
+		assert.NoError(err)
+
+		assert.Equal(test.expectedHostNetwork, actualHostNetwork)
+		assert.Equal(test.expectedDnsPolicy, actualDnsPolicy)
+	}
+}
+
+func TestRedisImagePullPolicy(t *testing.T) {
+	tests := []struct {
+		name                   string
+		policy                 corev1.PullPolicy
+		exporterPolicy         corev1.PullPolicy
+		expectedPolicy         corev1.PullPolicy
+		expectedExporterPolicy corev1.PullPolicy
+	}{
+		{
+			name:                   "Default",
+			expectedPolicy:         corev1.PullAlways,
+			expectedExporterPolicy: corev1.PullAlways,
+		},
+		{
+			name:                   "Custom",
+			policy:                 corev1.PullIfNotPresent,
+			exporterPolicy:         corev1.PullNever,
+			expectedPolicy:         corev1.PullIfNotPresent,
+			expectedExporterPolicy: corev1.PullNever,
+		},
+	}
+
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		var policy corev1.PullPolicy
+		var exporterPolicy corev1.PullPolicy
+
+		rf := generateRF()
+		rf.Spec.Redis.ImagePullPolicy = test.policy
+		rf.Spec.Redis.Exporter.Enabled = true
+		rf.Spec.Redis.Exporter.ImagePullPolicy = test.expectedExporterPolicy
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetStatefulSet", namespace, mock.Anything).Once().Return(nil, notFound("statefulsets", name))
+		ms.On("CreateOrUpdateStatefulSet", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			ss := args.Get(1).(*appsv1.StatefulSet)
+			policy = ss.Spec.Template.Spec.Containers[0].ImagePullPolicy
+			exporterPolicy = ss.Spec.Template.Spec.Containers[1].ImagePullPolicy
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
+
+		assert.NoError(err)
+		assert.Equal(string(test.expectedPolicy), string(policy))
+		assert.Equal(string(test.expectedExporterPolicy), string(exporterPolicy))
+	}
+}
+
+func TestSentinelImagePullPolicy(t *testing.T) {
+	tests := []struct {
+		name                 string
+		policy               corev1.PullPolicy
+		expectedPolicy       corev1.PullPolicy
+		expectedConfigPolicy corev1.PullPolicy
+	}{
+		{
+			name:                 "Default",
+			expectedPolicy:       corev1.PullAlways,
+			expectedConfigPolicy: corev1.PullAlways,
+		},
+		{
+			name:                 "Custom",
+			policy:               corev1.PullIfNotPresent,
+			expectedPolicy:       corev1.PullIfNotPresent,
+			expectedConfigPolicy: corev1.PullIfNotPresent,
+		},
+	}
+
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		var policy corev1.PullPolicy
+		var configPolicy corev1.PullPolicy
+
+		rf := generateRF()
+		rf.Spec.Sentinel.ImagePullPolicy = test.policy
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetDeployment", namespace, mock.Anything).Once().Return(nil, notFound("deployments", name))
+		ms.On("CreateOrUpdateDeployment", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			d := args.Get(1).(*appsv1.Deployment)
+			policy = d.Spec.Template.Spec.Containers[0].ImagePullPolicy
+			configPolicy = d.Spec.Template.Spec.InitContainers[0].ImagePullPolicy
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureSentinelDeployment(rf, nil, []metav1.OwnerReference{})
+
+		assert.NoError(err)
+		assert.Equal(string(test.expectedPolicy), string(policy))
+		assert.Equal(string(test.expectedConfigPolicy), string(configPolicy))
+	}
+}
+
+func TestRedisExtraVolumeMounts(t *testing.T) {
+	mode := int32(755)
+	tests := []struct {
+		name                 string
+		expectedVolumes      []corev1.Volume
+		expectedVolumeMounts []corev1.VolumeMount
+	}{
+		{
+			name: "EmptyDir",
+			expectedVolumes: []corev1.Volume{
+				{
+					Name: "foo",
+					VolumeSource: corev1.VolumeSource{
+						EmptyDir: &corev1.EmptyDirVolumeSource{},
+					},
+				},
+			},
+			expectedVolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "foo",
+					MountPath: "/mnt/foo",
+				},
+			},
+		},
+		{
+			name: "ConfigMap",
+			expectedVolumes: []corev1.Volume{
+				{
+					Name: "bar",
+					VolumeSource: corev1.VolumeSource{
+						ConfigMap: &corev1.ConfigMapVolumeSource{
+							LocalObjectReference: corev1.LocalObjectReference{
+								Name: "bar-cm",
+							},
+							DefaultMode: &mode,
+						},
+					},
+				},
+			},
+			expectedVolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "bar",
+					MountPath: "/mnt/scripts",
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		var extraVolume corev1.Volume
+		var extraVolumeMount corev1.VolumeMount
+
+		rf := generateRF()
+		rf.Spec.Redis.ExtraVolumes = test.expectedVolumes
+		rf.Spec.Redis.ExtraVolumeMounts = test.expectedVolumeMounts
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetStatefulSet", namespace, mock.Anything).Once().Return(nil, notFound("statefulsets", name))
+		ms.On("CreateOrUpdateStatefulSet", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			s := args.Get(1).(*appsv1.StatefulSet)
+			extraVolume = s.Spec.Template.Spec.Volumes[3]
+			extraVolumeMount = s.Spec.Template.Spec.Containers[0].VolumeMounts[4]
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
+
+		assert.NoError(err)
+		assert.Equal(test.expectedVolumes[0], extraVolume)
+		assert.Equal(test.expectedVolumeMounts[0], extraVolumeMount)
+	}
+}
+
+func TestSentinelExtraVolumeMounts(t *testing.T) {
+	mode := int32(755)
+	tests := []struct {
+		name                 string
+		expectedVolumes      []corev1.Volume
+		expectedVolumeMounts []corev1.VolumeMount
+	}{
+		{
+			name: "EmptyDir",
+			expectedVolumes: []corev1.Volume{
+				{
+					Name: "foo",
+					VolumeSource: corev1.VolumeSource{
+						EmptyDir: &corev1.EmptyDirVolumeSource{},
+					},
+				},
+			},
+			expectedVolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "foo",
+					MountPath: "/mnt/foo",
+				},
+			},
+		},
+		{
+			name: "ConfigMap",
+			expectedVolumes: []corev1.Volume{
+				{
+					Name: "bar",
+					VolumeSource: corev1.VolumeSource{
+						ConfigMap: &corev1.ConfigMapVolumeSource{
+							LocalObjectReference: corev1.LocalObjectReference{
+								Name: "bar-cm",
+							},
+							DefaultMode: &mode,
+						},
+					},
+				},
+			},
+			expectedVolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "bar",
+					MountPath: "/mnt/scripts",
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		var extraVolume corev1.Volume
+		var extraVolumeMount corev1.VolumeMount
+
+		rf := generateRF()
+		rf.Spec.Sentinel.ExtraVolumes = test.expectedVolumes
+		rf.Spec.Sentinel.ExtraVolumeMounts = test.expectedVolumeMounts
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetDeployment", namespace, mock.Anything).Once().Return(nil, notFound("deployments", name))
+		ms.On("CreateOrUpdateDeployment", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			d := args.Get(1).(*appsv1.Deployment)
+			extraVolume = d.Spec.Template.Spec.Volumes[2]
+			extraVolumeMount = d.Spec.Template.Spec.Containers[0].VolumeMounts[1]
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureSentinelDeployment(rf, nil, []metav1.OwnerReference{})
+
+		assert.NoError(err)
+		assert.Equal(test.expectedVolumes[0], extraVolume)
+		assert.Equal(test.expectedVolumeMounts[0], extraVolumeMount)
+	}
+}
+
+func TestCustomPort(t *testing.T) {
+	default_port := redisfailoverv1.Port(6379)
+	custom_port := redisfailoverv1.Port(12345)
+	tests := []struct {
+		name                  string
+		port                  redisfailoverv1.Port
+		expectedContainerPort []corev1.ContainerPort
+	}{
+		{
+			name: "Default port",
+			port: default_port,
+			expectedContainerPort: []corev1.ContainerPort{
+				{
+					Name:          "redis",
+					ContainerPort: default_port.ToInt32(),
+					Protocol:      corev1.ProtocolTCP,
+				},
+			},
+		},
+		{
+			name: "Custom port",
+			port: custom_port,
+			expectedContainerPort: []corev1.ContainerPort{
+				{
+					Name:          "redis",
+					ContainerPort: custom_port.ToInt32(),
+					Protocol:      corev1.ProtocolTCP,
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		var port corev1.ContainerPort
+
+		rf := generateRF()
+		rf.Spec.Redis.Port = test.port
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetStatefulSet", namespace, mock.Anything).Once().Return(nil, notFound("statefulsets", name))
+		ms.On("CreateOrUpdateStatefulSet", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			s := args.Get(1).(*appsv1.StatefulSet)
+			port = s.Spec.Template.Spec.Containers[0].Ports[0]
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
+
+		assert.NoError(err)
+		assert.Equal(test.expectedContainerPort[0], port)
+	}
+}
+
+func TestRedisEnv(t *testing.T) {
+	default_port := redisfailoverv1.Port(6379)
+	tests := []struct {
+		name             string
+		auth             string
+		expectedRedisEnv []corev1.EnvVar
+	}{
+		{
+			name: "without auth",
+			auth: "",
+			expectedRedisEnv: []corev1.EnvVar{
+				{
+					Name:  "REDIS_ADDR",
+					Value: fmt.Sprintf("redis://127.0.0.1:%[1]v", default_port),
+				},
+				{
+					Name:  "REDIS_PORT",
+					Value: fmt.Sprintf("%[1]v", default_port),
+				},
+				{
+					Name:  "REDIS_USER",
+					Value: "default",
+				},
+			},
+		},
+		{
+			name: "with auth",
+			auth: "redis-secret",
+			expectedRedisEnv: []corev1.EnvVar{
+				{
+					Name:  "REDIS_ADDR",
+					Value: fmt.Sprintf("redis://127.0.0.1:%[1]v", default_port),
+				},
+				{
+					Name:  "REDIS_PORT",
+					Value: fmt.Sprintf("%[1]v", default_port),
+				},
+				{
+					Name:  "REDIS_USER",
+					Value: "default",
+				},
+				{
+					Name: "REDIS_PASSWORD",
+					ValueFrom: &corev1.EnvVarSource{
+						SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
+								Name: "redis-secret",
+							},
+							Key: "password",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		var env []corev1.EnvVar
+
+		rf := generateRF()
+		rf.Spec.Redis.Port = default_port
+		if test.auth != "" {
+			rf.Spec.Auth.SecretPath = test.auth
+		}
+
+		ms := &mK8SService.Services{}
+		// The pod template records a digest of the password, so the statefulset
+		// ensurer reads the secret.
+		if test.auth != "" {
+			ms.On("GetSecret", namespace, test.auth).Once().Return(&corev1.Secret{
+				Data: map[string][]byte{"password": []byte("s3cr3tpass")},
+			}, nil)
+		}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetStatefulSet", namespace, mock.Anything).Once().Return(nil, notFound("statefulsets", name))
+		ms.On("CreateOrUpdateStatefulSet", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			s := args.Get(1).(*appsv1.StatefulSet)
+			env = s.Spec.Template.Spec.Containers[0].Env
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
+
+		assert.NoError(err)
+		assert.Equal(test.expectedRedisEnv, env)
+	}
+}
+
+// Redis reads requirepass at startup, so a pod keeps the password it began
+// with. The secret reaches it by reference, which leaves the pod template
+// identical across a rotation and gives the rolling update no new revision to
+// apply. A digest of the password is what makes the rotation visible.
+func TestRedisStatefulSetPasswordChecksum(t *testing.T) {
+	const key = "checksum/redis-password"
+
+	stampIn := func(t *testing.T, ns, nm, secretPath, password string) *appsv1.StatefulSet {
+		t.Helper()
+
+		rf := generateRF()
+		rf.ObjectMeta.Namespace = ns
+		rf.ObjectMeta.Name = nm
+		rf.Spec.Auth.SecretPath = secretPath
+
+		var got *appsv1.StatefulSet
+		ms := &mK8SService.Services{}
+		if secretPath != "" {
+			ms.On("GetSecret", ns, secretPath).Once().Return(&corev1.Secret{
+				Data: map[string][]byte{"password": []byte(password)},
+			}, nil)
+		}
+		ms.On("CreateOrUpdatePodDisruptionBudget", ns, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetStatefulSet", ns, mock.Anything).Once().Return(nil, notFound("statefulsets", name))
+		ms.On("CreateOrUpdateStatefulSet", ns, mock.Anything).Once().Run(func(args mock.Arguments) {
+			got = args.Get(1).(*appsv1.StatefulSet)
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		if err := client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{}); err != nil {
+			t.Fatalf("EnsureRedisStatefulset: %v", err)
+		}
+		return got
+	}
+
+	stamp := func(t *testing.T, secretPath, password string) *appsv1.StatefulSet {
+		t.Helper()
+		return stampIn(t, namespace, name, secretPath, password)
+	}
+
+	t.Run("carries no annotation when the failover has no password", func(t *testing.T) {
+		// Every failover in the estate is in this state, so the template has to
+		// come out unchanged or upgrading the operator restarts all of them.
+		assert.NotContains(t, stamp(t, "", "").Spec.Template.Annotations, key)
+	})
+
+	t.Run("changes when the password changes", func(t *testing.T) {
+		before := stamp(t, "redis-auth", "s3cr3tpass").Spec.Template.Annotations[key]
+		after := stamp(t, "redis-auth", "rotated-pass").Spec.Template.Annotations[key]
+
+		assert.NotEmpty(t, before)
+		assert.NotEqual(t, before, after, "a rotation must produce a new revision to roll to")
+	})
+
+	t.Run("is stable for an unchanged password", func(t *testing.T) {
+		// Otherwise every reconcile would look like a rotation and roll the pods.
+		first := stamp(t, "redis-auth", "s3cr3tpass").Spec.Template.Annotations[key]
+		second := stamp(t, "redis-auth", "s3cr3tpass").Spec.Template.Annotations[key]
+
+		assert.Equal(t, first, second)
+	})
+
+	t.Run("does not expose the password", func(t *testing.T) {
+		// The pod template is readable by anything that can get pods.
+		assert.NotContains(t, stamp(t, "redis-auth", "s3cr3tpass").Spec.Template.Annotations[key], "s3cr3tpass")
+	})
+
+	t.Run("differs between failovers sharing a password", func(t *testing.T) {
+		// A digest of the password alone is the same value everywhere, so one
+		// table of precomputed hashes would read it back out of any annotation
+		// in any cluster. Tying it to the failover confines such a table to a
+		// single one.
+		here := stampIn(t, "testns", "test", "redis-auth", "s3cr3tpass").Spec.Template.Annotations[key]
+		there := stampIn(t, "otherns", "other", "redis-auth", "s3cr3tpass").Spec.Template.Annotations[key]
+
+		assert.NotEmpty(t, here)
+		assert.NotEqual(t, here, there)
+	})
+}
+
+func TestRedisStartupProbe(t *testing.T) {
+	mode := int32(0744)
+	tests := []struct {
+		name                string
+		expectedVolume      corev1.Volume
+		expectedVolumeMount corev1.VolumeMount
+	}{
+		{
+			name: "startup_config",
+			expectedVolume: corev1.Volume{
+				Name: "redis-startup-config",
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: "startup_config",
+						},
+						DefaultMode: &mode,
+					},
+				},
+			},
+			expectedVolumeMount: corev1.VolumeMount{
+				Name:      "redis-startup-config",
+				MountPath: "/redis-startup",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		var startupVolumes []corev1.Volume
+		var startupVolumeMounts []corev1.VolumeMount
+
+		rf := generateRF()
+		rf.Spec.Redis.StartupConfigMap = test.name
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetStatefulSet", namespace, mock.Anything).Once().Return(nil, notFound("statefulsets", name))
+		ms.On("CreateOrUpdateStatefulSet", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			s := args.Get(1).(*appsv1.StatefulSet)
+			startupVolumes = s.Spec.Template.Spec.Volumes
+			startupVolumeMounts = s.Spec.Template.Spec.Containers[0].VolumeMounts
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
+
+		assert.NoError(err)
+		assert.Contains(startupVolumes, test.expectedVolume)
+		assert.Contains(startupVolumeMounts, test.expectedVolumeMount)
+	}
+}
+
+func TestSentinelStartupProbe(t *testing.T) {
+	mode := int32(0744)
+	tests := []struct {
+		name                string
+		expectedVolume      corev1.Volume
+		expectedVolumeMount corev1.VolumeMount
+	}{
+		{
+			name: "startup_config",
+			expectedVolume: corev1.Volume{
+				Name: "sentinel-startup-config",
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: "startup_config",
+						},
+						DefaultMode: &mode,
+					},
+				},
+			},
+			expectedVolumeMount: corev1.VolumeMount{
+				Name:      "sentinel-startup-config",
+				MountPath: "/sentinel-startup",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		var startupVolumes []corev1.Volume
+		var startupVolumeMounts []corev1.VolumeMount
+
+		rf := generateRF()
+		rf.Spec.Sentinel.StartupConfigMap = test.name
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetDeployment", namespace, mock.Anything).Once().Return(nil, notFound("deployments", name))
+		ms.On("CreateOrUpdateDeployment", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			d := args.Get(1).(*appsv1.Deployment)
+			startupVolumes = d.Spec.Template.Spec.Volumes
+			startupVolumeMounts = d.Spec.Template.Spec.Containers[0].VolumeMounts
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureSentinelDeployment(rf, nil, []metav1.OwnerReference{})
+
+		assert.NoError(err)
+		assert.Contains(startupVolumes, test.expectedVolume)
+		assert.Contains(startupVolumeMounts, test.expectedVolumeMount)
+	}
+}
+
+func TestRedisCustomLivenessProbe(t *testing.T) {
+	tests := []struct {
+		name                  string
+		customLivenessProbe   *corev1.Probe
+		expectedLivenessProbe *corev1.Probe
+	}{
+		{
+			name: "liveness_probe",
+			customLivenessProbe: &corev1.Probe{
+				InitialDelaySeconds: 30,
+				TimeoutSeconds:      10,
+				FailureThreshold:    10,
+				PeriodSeconds:       25,
+				ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{
+							"sh",
+							"-c",
+							"redis-cli -h 127.0.0.1 -p ${REDIS_PORT} --user pinger --pass pingpass --no-auth-warning ping | grep PONG",
+						},
+					},
+				},
+			},
+			expectedLivenessProbe: &corev1.Probe{
+				InitialDelaySeconds: 30,
+				TimeoutSeconds:      10,
+				FailureThreshold:    10,
+				PeriodSeconds:       25,
+				ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{
+							"sh",
+							"-c",
+							"redis-cli -h 127.0.0.1 -p ${REDIS_PORT} --user pinger --pass pingpass --no-auth-warning ping | grep PONG",
+						},
+					},
+				},
+			},
+		},
+		{
+			name:                "liveness_probe_nil",
+			customLivenessProbe: nil,
+			expectedLivenessProbe: &corev1.Probe{
+				InitialDelaySeconds: 30,
+				TimeoutSeconds:      5,
+				FailureThreshold:    6,
+				PeriodSeconds:       15,
+				ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{
+							"sh",
+							"-c",
+							"redis-cli -h $(hostname) -p 6379 --user pinger --pass pingpass --no-auth-warning ping | grep PONG",
+						},
+					},
+				},
+			},
+		},
+	}
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		var livenessProbe *corev1.Probe
+		rf := generateRF()
+		rf.Spec.Redis.CustomLivenessProbe = test.customLivenessProbe
+		rf.Spec.Redis.Port = 6379
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetStatefulSet", namespace, mock.Anything).Once().Return(nil, notFound("statefulsets", name))
+		ms.On("CreateOrUpdateStatefulSet", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			s := args.Get(1).(*appsv1.StatefulSet)
+			livenessProbe = s.Spec.Template.Spec.Containers[0].LivenessProbe
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
+
+		assert.NoError(err)
+		assert.Equal(test.expectedLivenessProbe, livenessProbe)
+	}
+}
+
+func TestSentinelCustomLivenessProbe(t *testing.T) {
+	tests := []struct {
+		name                  string
+		customLivenessProbe   *corev1.Probe
+		expectedLivenessProbe *corev1.Probe
+	}{
+		{
+			name: "liveness_probe",
+			customLivenessProbe: &corev1.Probe{
+				InitialDelaySeconds: 30,
+				TimeoutSeconds:      10,
+				FailureThreshold:    10,
+				PeriodSeconds:       25,
+				ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{
+							"sh",
+							"-c",
+							"redis-cli -h 127.0.0.1 -p 26379 ping",
+						},
+					},
+				},
+			},
+			expectedLivenessProbe: &corev1.Probe{
+				InitialDelaySeconds: 30,
+				TimeoutSeconds:      10,
+				FailureThreshold:    10,
+				PeriodSeconds:       25,
+				ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{
+							"sh",
+							"-c",
+							"redis-cli -h 127.0.0.1 -p 26379 ping",
+						},
+					},
+				},
+			},
+		},
+		{
+			name:                "liveness_probe_nil",
+			customLivenessProbe: nil,
+			expectedLivenessProbe: &corev1.Probe{
+				InitialDelaySeconds: 30,
+				TimeoutSeconds:      5,
+				ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{
+							"sh",
+							"-c",
+							"redis-cli -h $(hostname) -p 26379 ping",
+						},
+					},
+				},
+			},
+		},
+	}
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		var livenessProbe *corev1.Probe
+		rf := generateRF()
+		rf.Spec.Sentinel.CustomLivenessProbe = test.customLivenessProbe
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetDeployment", namespace, mock.Anything).Once().Return(nil, notFound("deployments", name))
+		ms.On("CreateOrUpdateDeployment", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			d := args.Get(1).(*appsv1.Deployment)
+			livenessProbe = d.Spec.Template.Spec.Containers[0].LivenessProbe
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureSentinelDeployment(rf, nil, []metav1.OwnerReference{})
+
+		assert.NoError(err)
+		assert.Equal(test.expectedLivenessProbe, livenessProbe)
+	}
+}
+
+func TestRedisCustomReadinessProbe(t *testing.T) {
+	tests := []struct {
+		name                   string
+		customReadinessProbe   *corev1.Probe
+		expectedReadinessProbe *corev1.Probe
+	}{
+		{
+			name: "readiness_probe",
+			customReadinessProbe: &corev1.Probe{
+				InitialDelaySeconds: 30,
+				TimeoutSeconds:      10,
+				FailureThreshold:    10,
+				PeriodSeconds:       25,
+				ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{"/bin/sh", "/redis-readiness/readiness.sh"},
+					},
+				},
+			},
+			expectedReadinessProbe: &corev1.Probe{
+				InitialDelaySeconds: 30,
+				TimeoutSeconds:      10,
+				FailureThreshold:    10,
+				PeriodSeconds:       25,
+				ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{"/bin/sh", "/redis-readiness/readiness.sh"},
+					},
+				},
+			},
+		},
+		{
+			name:                 "readiness_probe_nil",
+			customReadinessProbe: nil,
+			expectedReadinessProbe: &corev1.Probe{
+				InitialDelaySeconds: 30,
+				TimeoutSeconds:      5,
+				ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{"/bin/sh", "/redis-readiness/ready.sh"},
+					},
+				},
+			},
+		},
+	}
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		var readinessProbe *corev1.Probe
+		rf := generateRF()
+		rf.Spec.Redis.CustomReadinessProbe = test.customReadinessProbe
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetStatefulSet", namespace, mock.Anything).Once().Return(nil, notFound("statefulsets", name))
+		ms.On("CreateOrUpdateStatefulSet", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			s := args.Get(1).(*appsv1.StatefulSet)
+			readinessProbe = s.Spec.Template.Spec.Containers[0].ReadinessProbe
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
+
+		assert.NoError(err)
+		assert.Equal(test.expectedReadinessProbe, readinessProbe)
+	}
+}
+
+func TestSentinelCustomReadinessProbe(t *testing.T) {
+	tests := []struct {
+		name                   string
+		customReadinessProbe   *corev1.Probe
+		expectedReadinessProbe *corev1.Probe
+	}{
+		{
+			name: "liveness_probe",
+			customReadinessProbe: &corev1.Probe{
+				InitialDelaySeconds: 30,
+				TimeoutSeconds:      10,
+				FailureThreshold:    10,
+				PeriodSeconds:       25,
+				ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{
+							"sh",
+							"-c",
+							"redis-cli -h 127.0.0.1 -p 26379 ping",
+						},
+					},
+				},
+			},
+			expectedReadinessProbe: &corev1.Probe{
+				InitialDelaySeconds: 30,
+				TimeoutSeconds:      10,
+				FailureThreshold:    10,
+				PeriodSeconds:       25,
+				ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{
+							"sh",
+							"-c",
+							"redis-cli -h 127.0.0.1 -p 26379 ping",
+						},
+					},
+				},
+			},
+		},
+		{
+			name:                 "liveness_probe_nil",
+			customReadinessProbe: nil,
+			expectedReadinessProbe: &corev1.Probe{
+				InitialDelaySeconds: 30,
+				TimeoutSeconds:      5,
+				ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{
+							"sh",
+							"-c",
+							"redis-cli -h $(hostname) -p 26379 sentinel get-master-addr-by-name mymaster | head -n 1 | grep -vq '127.0.0.1'",
+						},
+					},
+				},
+			},
+		},
+	}
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		var readinessProbe *corev1.Probe
+		rf := generateRF()
+		rf.Spec.Sentinel.CustomReadinessProbe = test.customReadinessProbe
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetDeployment", namespace, mock.Anything).Once().Return(nil, notFound("deployments", name))
+		ms.On("CreateOrUpdateDeployment", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			d := args.Get(1).(*appsv1.Deployment)
+			readinessProbe = d.Spec.Template.Spec.Containers[0].ReadinessProbe
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureSentinelDeployment(rf, nil, []metav1.OwnerReference{})
+
+		assert.NoError(err)
+		assert.Equal(test.expectedReadinessProbe, readinessProbe)
+	}
+}
+
+func TestRedisCustomStartupProbe(t *testing.T) {
+	tests := []struct {
+		name                 string
+		customStartupProbe   *corev1.Probe
+		expectedStartupProbe *corev1.Probe
+	}{
+		{
+			name: "readiness_probe",
+			customStartupProbe: &corev1.Probe{
+				InitialDelaySeconds: 30,
+				TimeoutSeconds:      10,
+				FailureThreshold:    10,
+				PeriodSeconds:       25,
+				ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{"/bin/sh", "/redis-startup/startup.sh"},
+					},
+				},
+			},
+			expectedStartupProbe: &corev1.Probe{
+				InitialDelaySeconds: 30,
+				TimeoutSeconds:      10,
+				FailureThreshold:    10,
+				PeriodSeconds:       25,
+				ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{"/bin/sh", "/redis-startup/startup.sh"},
+					},
+				},
+			},
+		},
+		{
+			name:                 "readiness_probe_nil",
+			customStartupProbe:   nil,
+			expectedStartupProbe: nil,
+		},
+	}
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		var startupProbe *corev1.Probe
+		rf := generateRF()
+		rf.Spec.Redis.CustomStartupProbe = test.customStartupProbe
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetStatefulSet", namespace, mock.Anything).Once().Return(nil, notFound("statefulsets", name))
+		ms.On("CreateOrUpdateStatefulSet", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			s := args.Get(1).(*appsv1.StatefulSet)
+			startupProbe = s.Spec.Template.Spec.Containers[0].StartupProbe
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
+
+		assert.NoError(err)
+		assert.Equal(test.expectedStartupProbe, startupProbe)
+	}
+}
+
+func TestSentinelCustomStartupProbe(t *testing.T) {
+	tests := []struct {
+		name                 string
+		customStartupProbe   *corev1.Probe
+		expectedStartupProbe *corev1.Probe
+	}{
+		{
+			name: "liveness_probe",
+			customStartupProbe: &corev1.Probe{
+				InitialDelaySeconds: 30,
+				TimeoutSeconds:      10,
+				FailureThreshold:    10,
+				PeriodSeconds:       25,
+				ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{
+							"sh",
+							"-c",
+							"redis-cli -h 127.0.0.1 -p 26379 ping",
+						},
+					},
+				},
+			},
+			expectedStartupProbe: &corev1.Probe{
+				InitialDelaySeconds: 30,
+				TimeoutSeconds:      10,
+				FailureThreshold:    10,
+				PeriodSeconds:       25,
+				ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{
+							"sh",
+							"-c",
+							"redis-cli -h 127.0.0.1 -p 26379 ping",
+						},
+					},
+				},
+			},
+		},
+		{
+			name:                 "liveness_probe_nil",
+			customStartupProbe:   nil,
+			expectedStartupProbe: nil,
+		},
+	}
+	for _, test := range tests {
+		assert := assert.New(t)
+
+		var startupProbe *corev1.Probe
+		rf := generateRF()
+		rf.Spec.Sentinel.CustomStartupProbe = test.customStartupProbe
+
+		ms := &mK8SService.Services{}
+		ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+		ms.On("GetDeployment", namespace, mock.Anything).Once().Return(nil, notFound("deployments", name))
+		ms.On("CreateOrUpdateDeployment", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+			d := args.Get(1).(*appsv1.Deployment)
+			startupProbe = d.Spec.Template.Spec.Containers[0].StartupProbe
+		}).Return(nil)
+
+		client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+		err := client.EnsureSentinelDeployment(rf, nil, []metav1.OwnerReference{})
+
+		assert.NoError(err)
+		assert.Equal(test.expectedStartupProbe, startupProbe)
+	}
+}
+
+// TestEnsureRedisStatefulSetSkipsUpdateWhenDigestUnchanged verifies
+// that a second reconcile with an identical CR does not call
+// CreateOrUpdateStatefulSet, which is what prevents
+// metadata.generation from incrementing on every reconcile cycle.
+func TestEnsureRedisStatefulSetSkipsUpdateWhenDigestUnchanged(t *testing.T) {
+	assert := assert.New(t)
+	rf := generateRF()
+
+	// First reconcile: resource does not exist — create it and
+	// capture the stored digest.
+	var firstSS *appsv1.StatefulSet
+	ms := &mK8SService.Services{}
+	ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+	ms.On("GetStatefulSet", namespace, mock.Anything).Once().Return(nil, notFound("statefulsets", name))
+	ms.On("CreateOrUpdateStatefulSet", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+		firstSS = args.Get(1).(*appsv1.StatefulSet).DeepCopy()
+	}).Return(nil)
+
+	client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+	err := client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
+	assert.NoError(err)
+	ms.AssertExpectations(t)
+
+	// Second reconcile: same CR, resource already exists with the
+	// stored digest. CreateOrUpdateStatefulSet must NOT be called
+	// — if it were, k8s would increment metadata.generation and
+	// trigger a KubeDeploymentGenerationMismatch alert.
+	ms2 := &mK8SService.Services{}
+	ms2.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+	ms2.On("GetStatefulSet", namespace, mock.Anything).Once().Return(firstSS, nil)
+
+	client2 := rfservice.NewRedisFailoverKubeClient(ms2, log.Dummy, metrics.Dummy)
+	err = client2.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
+	assert.NoError(err)
+	ms2.AssertNotCalled(t, "CreateOrUpdateStatefulSet")
+	ms2.AssertExpectations(t)
+}
+
+// TestEnsureRedisStatefulSetUpdatesWhenSpecChanges verifies that
+// changing the CR causes a real API call with the updated spec and a
+// new digest — i.e. that the skip logic doesn't suppress legitimate
+// updates.
+func TestEnsureRedisStatefulSetUpdatesWhenSpecChanges(t *testing.T) {
+	assert := assert.New(t)
+	rf := generateRF()
+
+	// First reconcile: create and capture the annotated resource.
+	var firstSS *appsv1.StatefulSet
+	ms := &mK8SService.Services{}
+	ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+	ms.On("GetStatefulSet", namespace, mock.Anything).Once().Return(nil, notFound("statefulsets", name))
+	ms.On("CreateOrUpdateStatefulSet", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+		firstSS = args.Get(1).(*appsv1.StatefulSet).DeepCopy()
+	}).Return(nil)
+
+	client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+	err := client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
+	assert.NoError(err)
+	ms.AssertExpectations(t)
+
+	// Mutate the CR.
+	rf.Spec.Redis.Replicas = int32(5)
+
+	// Second reconcile: digest mismatch —
+	// CreateOrUpdateStatefulSet must be called with the updated
+	// spec and a different digest annotation.
+	var secondSS *appsv1.StatefulSet
+	ms2 := &mK8SService.Services{}
+	ms2.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+	ms2.On("GetStatefulSet", namespace, mock.Anything).Once().Return(firstSS, nil)
+	ms2.On("CreateOrUpdateStatefulSet", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+		secondSS = args.Get(1).(*appsv1.StatefulSet).DeepCopy()
+	}).Return(nil)
+
+	client2 := rfservice.NewRedisFailoverKubeClient(ms2, log.Dummy, metrics.Dummy)
+	err = client2.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
+	assert.NoError(err)
+	ms2.AssertExpectations(t)
+
+	// The resource sent to the API must carry the new replica
+	// count.
+	assert.Equal(int32(5), *secondSS.Spec.Replicas)
+	// The digest must have changed so that the next reconcile
+	// also detects it correctly.
+	assert.NotEqual(
+		firstSS.Annotations["checksum/redis-statefulset-spec"],
+		secondSS.Annotations["checksum/redis-statefulset-spec"],
+	)
+}
+
+// TestEnsureRedisStatefulSetWritesDigestAnnotation verifies that the
+// operator stores a well-formed SHA-256 hex digest on the
+// StatefulSet's metadata annotations after creation. That annotation
+// is what subsequent reconciles compare against to decide whether to
+// skip.
+func TestEnsureRedisStatefulSetWritesDigestAnnotation(t *testing.T) {
+	assert := assert.New(t)
+	rf := generateRF()
+
+	var createdSS *appsv1.StatefulSet
+	ms := &mK8SService.Services{}
+	ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+	ms.On("GetStatefulSet", namespace, mock.Anything).Once().Return(nil, notFound("statefulsets", name))
+	ms.On("CreateOrUpdateStatefulSet", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+		createdSS = args.Get(1).(*appsv1.StatefulSet).DeepCopy()
+	}).Return(nil)
+
+	client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+	err := client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
+	assert.NoError(err)
+	ms.AssertExpectations(t)
+
+	digest := createdSS.Annotations["checksum/redis-statefulset-spec"]
+	assert.NotEmpty(digest)
+	assert.Regexp(regexp.MustCompile(`^[0-9a-f]{64}$`), digest, "digest must be a lowercase SHA-256 hex string")
+}
+
+// TestEnsureRedisStatefulSetUpdatesWhenAnnotationAbsent covers the
+// upgrade path: a StatefulSet that exists in the cluster but
+// pre-dates the digest annotation (written before this operator
+// version was deployed) must still be updated so that the annotation
+// is stored and future reconciles can skip correctly.
+func TestEnsureRedisStatefulSetUpdatesWhenAnnotationAbsent(t *testing.T) {
+	assert := assert.New(t)
+	rf := generateRF()
+
+	// Simulate a pre-existing StatefulSet with no digest
+	// annotation.
+	existingSS := &appsv1.StatefulSet{}
+
+	ms := &mK8SService.Services{}
+	ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+	ms.On("GetStatefulSet", namespace, mock.Anything).Once().Return(existingSS, nil)
+	ms.On("CreateOrUpdateStatefulSet", namespace, mock.Anything).Once().Return(nil)
+
+	client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+	err := client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
+	assert.NoError(err)
+	ms.AssertExpectations(t)
+}
+
+// TestEnsureSentinelDeploymentSkipsUpdateWhenDigestUnchanged verifies
+// that a second reconcile with an identical CR does not call
+// CreateOrUpdateDeployment, which is what prevents
+// metadata.generation from incrementing on every reconcile cycle.
+func TestEnsureSentinelDeploymentSkipsUpdateWhenDigestUnchanged(t *testing.T) {
+	assert := assert.New(t)
+	rf := generateRF()
+
+	// First reconcile: resource does not exist — create it and
+	// capture the stored digest.
+	var firstDeployment *appsv1.Deployment
+	ms := &mK8SService.Services{}
+	ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+	ms.On("GetDeployment", namespace, mock.Anything).Once().Return(nil, notFound("deployments", name))
+	ms.On("CreateOrUpdateDeployment", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+		firstDeployment = args.Get(1).(*appsv1.Deployment).DeepCopy()
+	}).Return(nil)
+
+	client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+	err := client.EnsureSentinelDeployment(rf, nil, []metav1.OwnerReference{})
+	assert.NoError(err)
+	ms.AssertExpectations(t)
+
+	// Second reconcile: same CR, resource already exists with the
+	// stored digest. CreateOrUpdateDeployment must NOT be called
+	// — if it were, k8s would increment metadata.generation and
+	// trigger a KubeDeploymentGenerationMismatch alert.
+	ms2 := &mK8SService.Services{}
+	ms2.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+	ms2.On("GetDeployment", namespace, mock.Anything).Once().Return(firstDeployment, nil)
+
+	client2 := rfservice.NewRedisFailoverKubeClient(ms2, log.Dummy, metrics.Dummy)
+	err = client2.EnsureSentinelDeployment(rf, nil, []metav1.OwnerReference{})
+	assert.NoError(err)
+	ms2.AssertNotCalled(t, "CreateOrUpdateDeployment")
+	ms2.AssertExpectations(t)
+}
+
+// TestEnsureSentinelDeploymentUpdatesWhenSpecChanges verifies that
+// changing the CR causes a real API call with the updated spec and a
+// new digest — i.e. that the skip logic doesn't suppress legitimate
+// updates.
+func TestEnsureSentinelDeploymentUpdatesWhenSpecChanges(t *testing.T) {
+	assert := assert.New(t)
+	rf := generateRF()
+
+	// First reconcile: create and capture the annotated resource.
+	var firstDeployment *appsv1.Deployment
+	ms := &mK8SService.Services{}
+	ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+	ms.On("GetDeployment", namespace, mock.Anything).Once().Return(nil, notFound("deployments", name))
+	ms.On("CreateOrUpdateDeployment", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+		firstDeployment = args.Get(1).(*appsv1.Deployment).DeepCopy()
+	}).Return(nil)
+
+	client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+	err := client.EnsureSentinelDeployment(rf, nil, []metav1.OwnerReference{})
+	assert.NoError(err)
+	ms.AssertExpectations(t)
+
+	// Mutate the CR.
+	rf.Spec.Sentinel.Replicas = int32(5)
+
+	// Second reconcile: digest mismatch —
+	// CreateOrUpdateDeployment must be called with the updated
+	// spec and a different digest annotation.
+	var secondDeployment *appsv1.Deployment
+	ms2 := &mK8SService.Services{}
+	ms2.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+	ms2.On("GetDeployment", namespace, mock.Anything).Once().Return(firstDeployment, nil)
+	ms2.On("CreateOrUpdateDeployment", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+		secondDeployment = args.Get(1).(*appsv1.Deployment).DeepCopy()
+	}).Return(nil)
+
+	client2 := rfservice.NewRedisFailoverKubeClient(ms2, log.Dummy, metrics.Dummy)
+	err = client2.EnsureSentinelDeployment(rf, nil, []metav1.OwnerReference{})
+	assert.NoError(err)
+	ms2.AssertExpectations(t)
+
+	// The resource sent to the API must carry the new replica
+	// count.
+	assert.Equal(int32(5), *secondDeployment.Spec.Replicas)
+	// The digest must have changed so that the next reconcile
+	// also detects it correctly.
+	assert.NotEqual(
+		firstDeployment.Annotations["checksum/sentinel-deployment-spec"],
+		secondDeployment.Annotations["checksum/sentinel-deployment-spec"],
+	)
+}
+
+// TestEnsureSentinelDeploymentWritesDigestAnnotation verifies that
+// the operator stores a well-formed SHA-256 hex digest on the
+// Deployment's metadata annotations after creation. That annotation
+// is what subsequent reconciles compare against to decide whether to
+// skip.
+func TestEnsureSentinelDeploymentWritesDigestAnnotation(t *testing.T) {
+	assert := assert.New(t)
+	rf := generateRF()
+
+	var createdDeployment *appsv1.Deployment
+	ms := &mK8SService.Services{}
+	ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+	ms.On("GetDeployment", namespace, mock.Anything).Once().Return(nil, notFound("deployments", name))
+	ms.On("CreateOrUpdateDeployment", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+		createdDeployment = args.Get(1).(*appsv1.Deployment).DeepCopy()
+	}).Return(nil)
+
+	client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+	err := client.EnsureSentinelDeployment(rf, nil, []metav1.OwnerReference{})
+	assert.NoError(err)
+	ms.AssertExpectations(t)
+
+	digest := createdDeployment.Annotations["checksum/sentinel-deployment-spec"]
+	assert.NotEmpty(digest)
+	assert.Regexp(regexp.MustCompile(`^[0-9a-f]{64}$`), digest, "digest must be a lowercase SHA-256 hex string")
+}
+
+// TestEnsureSentinelDeploymentUpdatesWhenAnnotationAbsent covers the
+// upgrade path: a Deployment that exists in the cluster but pre-dates
+// the digest annotation (written before this operator version was
+// deployed) must still be updated so that the annotation is stored
+// and future reconciles can skip correctly.
+func TestEnsureSentinelDeploymentUpdatesWhenAnnotationAbsent(t *testing.T) {
+	assert := assert.New(t)
+	rf := generateRF()
+
+	// Simulate a pre-existing Deployment with no digest
+	// annotation.
+	existingDeployment := &appsv1.Deployment{}
+
+	ms := &mK8SService.Services{}
+	ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+	ms.On("GetDeployment", namespace, mock.Anything).Once().Return(existingDeployment, nil)
+	ms.On("CreateOrUpdateDeployment", namespace, mock.Anything).Once().Return(nil)
+
+	client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+	err := client.EnsureSentinelDeployment(rf, nil, []metav1.OwnerReference{})
+	assert.NoError(err)
+	ms.AssertExpectations(t)
+}
+
+// The resources HAProxy needs are created together and have to go together. The
+// headless service is the one that used to be left behind: it is created
+// alongside the rest but under a different name, so a removal that named only
+// the HAProxy resources never touched it.
+func TestDestroyHaproxyMasterResourcesRemovesEverythingItCreated(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+	deleted := map[string]int{}
+	record := func(args mock.Arguments) { deleted[args.Get(1).(string)]++ }
+
+	ms := &mK8SService.Services{}
+	ms.On("DeleteService", namespace, mock.Anything).Run(record).Return(nil)
+	ms.On("DeleteConfigMap", namespace, mock.Anything).Run(record).Return(nil)
+	ms.On("DeleteDeployment", namespace, mock.Anything).Run(record).Return(nil)
+
+	client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+	assert.NoError(client.DestroyHaproxyMasterResources(rf))
+
+	// The haproxy service, configmap and deployment all carry the same name.
+	assert.Equal(3, deleted[rfservice.GetHaproxyMasterName(rf)])
+	assert.Equal(1, deleted[rfservice.GetRedisHeadlessName(rf)], "the headless service backing SRV discovery must go too")
+}
+
+// A set that was only partly created still has to be cleaned up. Reading one
+// resource first and stopping when it was absent left the others in place.
+func TestDestroyHaproxyMasterResourcesToleratesResourcesAlreadyGone(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+	gone := kerrors.NewNotFound(schema.GroupResource{Resource: "deployments"}, "rfrm-haproxy-test")
+
+	ms := &mK8SService.Services{}
+	ms.On("DeleteService", namespace, mock.Anything).Return(nil)
+	ms.On("DeleteConfigMap", namespace, mock.Anything).Return(nil)
+	// The deployment is missing; the service and configmap still need removing.
+	ms.On("DeleteDeployment", namespace, mock.Anything).Once().Return(gone)
+
+	client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+	assert.NoError(client.DestroyHaproxyMasterResources(rf))
+	ms.AssertNumberOfCalls(t, "DeleteService", 2)
+}
+
+// Any other failure to remove something is reported, rather than being taken as
+// permission to carry on deleting the rest.
+func TestDestroyHaproxyMasterResourcesReportsRealFailures(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+	ms := &mK8SService.Services{}
+	ms.On("DeleteService", namespace, mock.Anything).Once().Return(errors.New("apiserver is unwell"))
+
+	client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+	assert.Error(client.DestroyHaproxyMasterResources(rf))
+}
